@@ -6,6 +6,11 @@ import { mapJupiterOrder } from "../src/execution/solana/jupiter.ts";
 import { mapZeroExQuote } from "../src/execution/evm/zeroex.ts";
 import { quoteV2AmountOut, UniswapV2DirectExecutor } from "../src/execution/evm/uniswap.ts";
 import { PaperExecutor } from "../src/execution/paper.ts";
+import { buildInfuraUrl } from "../src/execution/evm/viem-client.ts";
+import {
+  decimalsFromDasAsset,
+  decimalsFromMintData,
+} from "../src/execution/solana/helius.ts";
 import type { Quote, QuoteRequest, RiskPolicy } from "../src/execution/types.ts";
 
 function baseQuote(overrides: Partial<Quote> = {}): Quote {
@@ -163,8 +168,7 @@ describe("quote mappings", () => {
   });
 });
 
-describe("PaperExecutor", () => {
-  test("quotes at the mark with decimal scaling", async () => {
+describe("PaperExecutor", () => {  test("quotes at the mark with decimal scaling", async () => {
     const paper = new PaperExecutor();
     const quote = await paper.quoteBuy({
       ...REQ,
@@ -184,5 +188,31 @@ describe("PaperExecutor", () => {
   test("requires a positive mark price", async () => {
     const paper = new PaperExecutor();
     await assert.rejects(paper.quoteBuy(REQ), /markPrice/);
+  });
+});
+
+describe("RPC sources", () => {
+  test("buildInfuraUrl covers mainnet hosts, null otherwise", () => {
+    assert.equal(buildInfuraUrl("bsc", "k"), "https://bsc-mainnet.infura.io/v3/k");
+    assert.equal(buildInfuraUrl("ethereum", "k"), "https://mainnet.infura.io/v3/k");
+    assert.equal(buildInfuraUrl("base", "k"), "https://base-mainnet.infura.io/v3/k");
+    assert.equal(buildInfuraUrl("robinhood", "k"), null);
+    assert.equal(buildInfuraUrl("bsc", ""), null);
+    assert.equal(buildInfuraUrl("bsc", undefined), null);
+  });
+
+  test("decimalsFromDasAsset reads token_info, rejects garbage", () => {
+    assert.equal(decimalsFromDasAsset({ token_info: { decimals: 6 } }), 6);
+    assert.equal(decimalsFromDasAsset({ token_info: { decimals: 0 } }), 0);
+    assert.equal(decimalsFromDasAsset({ token_info: {} }), null);
+    assert.equal(decimalsFromDasAsset(null), null);
+  });
+
+  test("decimalsFromMintData parses byte 44", () => {
+    const bytes = Buffer.alloc(82);
+    bytes[44] = 9;
+    assert.equal(decimalsFromMintData(bytes.toString("base64")), 9);
+    assert.equal(decimalsFromMintData(Buffer.alloc(10).toString("base64")), null);
+    assert.equal(decimalsFromMintData("!!!not-base64!!!"), null);
   });
 });

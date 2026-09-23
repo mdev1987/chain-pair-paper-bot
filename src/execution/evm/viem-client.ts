@@ -49,6 +49,26 @@ export const EVM_CHAIN_IDS: Record<string, number> = {
 };
 
 /**
+ * Infura host per chain (mainnet only — the bot never touches testnets).
+ * URL form: https://<host>.infura.io/v3/<INFURA_API_KEY>.
+ */
+const INFURA_HOSTS: Record<string, string> = {
+  ethereum: "mainnet",
+  bsc: "bsc-mainnet",
+  base: "base-mainnet",
+  arbitrum: "arbitrum-mainnet",
+  avalanche: "avalanche-mainnet",
+  polygon: "polygon-mainnet",
+};
+
+/** Pure builder, unit-tested. Null when the chain or key is missing. */
+export function buildInfuraUrl(chain: string, apiKey: string | undefined): string | null {
+  const host = INFURA_HOSTS[chain];
+  if (!host || !apiKey) return null;
+  return `https://${host}.infura.io/v3/${apiKey}`;
+}
+
+/**
  * Public read-only RPC defaults so simulation (decimals reads, direct-V2
  * quotes, eth_call) works without private endpoints. Low-frequency use
  * only — configure private EVM_RPC_URLS for anything heavier. No entry
@@ -65,7 +85,13 @@ const DEFAULT_PUBLIC_RPCS: Record<string, string> = {
 };
 
 function rpcUrls(): Record<string, string> {
+  // Precedence: explicit EVM_RPC_URLS > Infura key > public defaults.
   const merged: Record<string, string> = { ...DEFAULT_PUBLIC_RPCS };
+  const infuraKey = process.env.INFURA_API_KEY ?? "";
+  for (const chain of Object.keys(INFURA_HOSTS)) {
+    const url = buildInfuraUrl(chain, infuraKey);
+    if (url) merged[chain] = url;
+  }
   try {
     const parsed: unknown = JSON.parse(process.env.EVM_RPC_URLS ?? "{}");
     if (typeof parsed === "object" && parsed !== null) {
@@ -74,7 +100,7 @@ function rpcUrls(): Record<string, string> {
       }
     }
   } catch {
-    // Malformed EVM_RPC_URLS falls back to public defaults below.
+    // Malformed EVM_RPC_URLS falls back to Infura/public defaults above.
   }
   return merged;
 }

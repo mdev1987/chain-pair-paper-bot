@@ -5,6 +5,7 @@ import { ZeroExExecutor } from "./evm/zeroex.ts";
 import { UniswapV2DirectExecutor } from "./evm/uniswap.ts";
 import { JupiterExecutor } from "./solana/jupiter.ts";
 import { EVM_CHAIN_IDS, getEvmPublicClient, getEvmTokenDecimals } from "./evm/viem-client.ts";
+import { getSolanaTokenDecimals } from "./solana/helius.ts";
 import { simulateEvmCall } from "./evm/simulator.ts";
 
 /**
@@ -171,9 +172,16 @@ export async function simulateSwap(input: SimCheckInput): Promise<SimCheckResult
   };
 }
 
-/** Resolve position-token decimals for exit simulation (EVM on-chain read). */
+/** Resolve position-token decimals for exit simulation (EVM on-chain read, Solana via Helius). */
 export async function resolveTokenDecimals(chain: string, token: string): Promise<number | null> {
-  if (chain === "solana" || EVM_CHAIN_IDS[chain] === undefined) return null;
+  if (chain === "solana") {
+    try {
+      return await getSolanaTokenDecimals(token);
+    } catch {
+      return null;
+    }
+  }
+  if (EVM_CHAIN_IDS[chain] === undefined) return null;
   if (!/^0x[0-9a-fA-F]{40}$/.test(token)) return null;
   try {
     return await getEvmTokenDecimals(chain, token as `0x${string}`);
