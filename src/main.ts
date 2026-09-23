@@ -79,6 +79,14 @@ function restore(): void {
       log(`⚠️ recovery: position cap reached, skipping ${position.id}`);
       continue;
     }
+    // Backfill fields added after this state file was written: pre-upgrade
+    // positions lack path tracking and shadow-cost accrual, so seed neutral
+    // values instead of dropping the position.
+    position.lowestPrice ??= position.currentPrice;
+    position.lowestAt ??= position.openedAt;
+    position.highestAt ??= position.updatedAt;
+    position.shadowFeeUsd ??= 0;
+    position.shadowSlipUsd ??= 0;
     positions.set(position.id, position);
     // Restore the fee/slippage baseline so post-restart fills record
     // incremental (delta) costs instead of re-counting lifetime totals.
@@ -216,6 +224,16 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
 
   if (!config.entry.auto) return;
   if (positions.size >= config.entry.maxOpenPositions) return;
+
+  // Pre-entry exitability guard: skip pools where our own paper exit would
+  // move the price (estimated against half the venue liquidity). Logs and
+  // retries are handled by the caller — this only gates new entries.
+  const entryLiquidity = pairLiquidityUsd(pair);
+  const impactPct = (config.entry.positionSizeUsd / Math.max(1, entryLiquidity / 2)) * 100;
+  if (impactPct > config.entry.maxImpactPct) {
+    log(`⏭️ skip entry ${chain}:${pair.pairAddress}: est. impact ${impactPct.toFixed(2)}% > ${config.entry.maxImpactPct}%`);
+    return;
+  }
 
   const positionId = `${chain}:${pair.pairAddress}`;
   if (positions.has(positionId)) return;
@@ -428,6 +446,7 @@ async function trackPositions(): Promise<void> {
               break;
             case "TRAIL_EXIT":
             case "STOP_EXIT":
+            case "EARLY_EXIT":
             case "BREAKEVEN_EXIT":
             case "TIME_EXIT": {
               // State mutation first: proceeds, close record, removal and

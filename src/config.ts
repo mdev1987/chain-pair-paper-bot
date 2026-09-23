@@ -67,7 +67,13 @@ export const config = {
     auto: bool("AUTO_ENTRY", false),
     positionSizeUsd: num("POSITION_SIZE_USD", 10),
     maxOpenPositions: num("MAX_OPEN_POSITIONS", 5),
-    maxPositionAgeMin: num("MAX_POSITION_AGE_MIN", 40),
+    maxPositionAgeMin: num("MAX_POSITION_AGE_MIN", 60),
+    // Pre-entry exitability guard: estimated immediate-sell impact of one
+    // position against half the venue liquidity (assumed ~50/50 pool).
+    // Skips pools where our own paper exit would move the price — the
+    // signature of an unexitable fill. Backstop only: with MIN_LIQUIDITY_USD
+    // at 10k and $10 size, worst-case impact is ~0.2% and this never fires.
+    maxImpactPct: num("MAX_ENTRY_IMPACT_PCT", 5),
     feeEntryBps: num("PAPER_ENTRY_FEE_BPS", 0),
     feeExitBps: num("PAPER_EXIT_FEE_BPS", 0),
     slippageBps: num("PAPER_SLIPPAGE_BPS", 0),
@@ -96,11 +102,24 @@ export const config = {
   },
 
   dynamic: {
-    // After TP1 fills, ratchet the protective stop to breakeven (+ buffer).
-    // This is the "dynamic SL" leg: base initial stop -> breakeven ->
-    // trailing stop once TRAIL_ACTIVATION_PCT is reached.
+    // Protective-stop ratchet: once unrealized gain reaches BREAKEVEN_ARM_PCT
+    // (or TP1 fills, as a fallback), the stop moves to breakeven (+ buffer)
+    // until the trailing stop takes over. With the defaults the hierarchy is:
+    // initial -15% -> breakeven@+20% -> TP1+trail@+30%.
     breakevenAfterTp1: bool("BREAKEVEN_AFTER_TP1", true),
     breakevenBufferPct: num("BREAKEVEN_BUFFER_PCT", 0),
+    breakevenArmPct: num("BREAKEVEN_ARM_PCT", 20),
+  },
+
+  earlyStop: {
+    // Dead-on-arrival exit for fast collapses: a fresh position (younger
+    // than windowSec) that prints below -stopPct is exited immediately
+    // instead of riding the full initial stop. Targets the observed failure
+    // mode of pools that dump 50-100% within ~30s, where the normal stop
+    // cannot execute in time. Must stay tighter than the initial stop.
+    enabled: bool("EARLY_STOP_ENABLED", true),
+    stopPct: num("EARLY_STOP_PCT", 10),
+    windowSec: num("EARLY_STOP_WINDOW_S", 180),
   },
 
   tp: [
@@ -187,4 +206,23 @@ if (config.entry.positionSizeUsd <= 0 || config.entry.positionSizeUsd > config.p
 
 if (config.dynamic.breakevenBufferPct < 0 || config.dynamic.breakevenBufferPct > 10) {
   throw new Error("BREAKEVEN_BUFFER_PCT must be between 0 and 10");
+}
+
+if (config.dynamic.breakevenArmPct <= 0) {
+  throw new Error("BREAKEVEN_ARM_PCT must be positive");
+}
+
+if (
+  config.earlyStop.stopPct <= 0 ||
+  config.earlyStop.stopPct >= config.stops.initialPct
+) {
+  throw new Error("EARLY_STOP_PCT must be positive and tighter than INITIAL_STOP_PCT");
+}
+
+if (config.earlyStop.windowSec <= 0) {
+  throw new Error("EARLY_STOP_WINDOW_S must be positive");
+}
+
+if (config.entry.maxImpactPct <= 0) {
+  throw new Error("MAX_ENTRY_IMPACT_PCT must be positive");
 }

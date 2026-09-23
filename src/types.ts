@@ -50,6 +50,12 @@ export interface Position {
   entryPrice: number;
   currentPrice: number;
   highestPrice: number;
+  /** Lowest quoted price seen since open — for MAE/giveback research. */
+  lowestPrice: number;
+  /** When highestPrice was last set (ms epoch) — for time-to-MFE. */
+  highestAt: number;
+  /** When lowestPrice was last set (ms epoch) — for time-to-MAE. */
+  lowestAt: number;
   quantity: number;
   originalQuantity: number;
   initialUsdSize: number;
@@ -58,6 +64,13 @@ export interface Position {
   totalEntryFeeUsd: number;
   totalExitFeeUsd: number;
   totalSlippageUsd: number;
+  /**
+   * Shadow cost-model accrual (NET_PNL_100BPS_1PCT): modeled fee/slippage
+   * for research reporting only. Never touches simulated cash — see
+   * SHADOW_* in position.ts.
+   */
+  shadowFeeUsd: number;
+  shadowSlipUsd: number;
 
   openedAt: number;
   updatedAt: number;

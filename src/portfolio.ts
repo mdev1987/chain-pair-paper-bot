@@ -36,6 +36,12 @@ export interface PortfolioSnapshot {
  * Paper portfolio: cash + open-position market value = equity.
  * Proceeds from partial TPs and final exits flow back to cash via
  * onProceeds(); closed trades accumulate for win-rate / per-chain analysis.
+ *
+ * Accounting note: cash is NOT initial + closed-PnL. Each open position
+ * still has its $10 entry cost reserved out of cash, while banked partial-TP
+ * proceeds from still-open positions have already flowed back in. So:
+ * cash = initial + closedPnL + openPartialProceeds - openReservedCosts.
+ * Compare equity (cash + open market value), not cash, against closed PnL.
  */
 export class Portfolio {
   readonly initialBalanceUsd: number;

@@ -21,6 +21,7 @@ export function exitBadge(reason: string | undefined): string {
   switch (reason) {
     case "TRAIL_EXIT": return "📉 TRAILING EXIT";
     case "STOP_EXIT": return "🔴 STOP EXIT";
+    case "EARLY_STOP": return "🛑 EARLY STOP";
     case "BREAKEVEN_STOP": return "🛟 BREAKEVEN STOP";
     case "TIME_EXIT": return "⏱ TIME EXIT";
     default: return `🏁 CLOSED (${reason ?? "unknown"})`;

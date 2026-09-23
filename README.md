@@ -49,18 +49,20 @@ The client uses a sliding-window limiter below the 300 requests/minute API limit
 
 ```text
 Initial stop      -15%
+Early stop        -10% within the first 3 minutes (dead-on-arrival exit)
+Breakeven         arms at +20% (or after TP1 as fallback, buffer 0%)
 TP1               +30%  → sell 25% of original quantity
 TP2               +60%  → sell 25% of original quantity
 TP3              +100%  → sell 25% of original quantity
-Breakeven         arms after TP1 (BREAKEVEN_AFTER_TP1=true, buffer 0%)
 Trailing start    +30%
 Trailing distance  20%
-Time exit          40 minutes
+Time exit          60 minutes
+Entry impact guard skip pools where our $10 exit would move price > 5%
 ```
 
 The remaining 25% after the three TP levels is intended to be managed by the trailing stop.
 
-Effective stop order: trailing (once active) → breakeven (once TP1 banked) → initial stop. The breakeven leg protects the TP1-to-trail gap whenever `TP1_PCT < TRAIL_ACTIVATION_PCT`; with the defaults (30/30) both arm together and the trailing stop dominates.
+Effective stop order: trailing (once active) → breakeven (once armed) → early (fresh positions only) → initial stop. Breakeven arms at +20%, ahead of TP1/trailing at +30%, so protection ratchets up before the first partial. The early stop only binds when neither breakeven nor trailing has armed — the fast-collapse profile where the normal stop cannot execute in time.
 
 ## Paper portfolio
 
@@ -91,7 +93,7 @@ ANALYTICS_ENABLED=true
 DUCKDB_PATH=data/paper.duckdb
 ```
 
-Every entry fill, TP partial, and final exit is appended to `fills`, and every closed position gets one summary row in `trades` (`src/analytics.ts`, `@duckdb/node-api`). Contract addresses, pair, and pool IDs are stored **in full — no ellipsis truncation** (same for Telegram BUY/CLOSE messages). The ledger is best-effort: init/write failures are logged and trading continues; SIGTERM/SIGINT flushes a `CHECKPOINT` before exit.
+Every entry fill, TP partial, and final exit is appended to `fills`, and every closed position gets one summary row in `trades` (`src/analytics.ts`, `@duckdb/node-api`). Each trade row stores gross `pnl_usd` plus a shadow `net_pnl_usd` under cost model `NET_PNL_100BPS_1PCT` (100 bps fee + 1% slippage per side, research only — never applied to simulated cash) and the full path (`mfe_pct`, `mae_pct`, `exit_pct`, `giveback_pp`, `time_to_mfe_s`, `time_to_mae_s`) for holding-time/trailing research. Older ledgers gain the new columns automatically on open (`ADD COLUMN IF NOT EXISTS`). Contract addresses, pair, and pool IDs are stored **in full — no ellipsis truncation** (same for Telegram BUY/CLOSE messages). The ledger is best-effort: init/write failures are logged and trading continues; SIGTERM/SIGINT flushes a `CHECKPOINT` before exit.
 
 Example analysis (any script with access to `src/analytics.ts`):
 
@@ -165,7 +167,7 @@ import { convert } from "telegram-markdown-v2";
 Messages are authored in ordinary Markdown and converted before being sent with Telegram `parse_mode=MarkdownV2`. Report builders live in `src/report.ts` (pure functions, unit-tested in `tests/report.test.ts`); cash/equity accounting lives in `src/portfolio.ts`.
 
 - 🟢 BUY: token, chain + icon, DEX, full pair + pool IDs, full token CA, quote, entry, size, entry liquidity + pool age at entry, SL/TP/trail config, balance-before → cash-after, open slots.
-- Close (📉 trailing / 🔴 stop / 🛟 breakeven / ⏱ time): full pair + pool IDs, full token CA, entry → exit, high, TP hits, PnL $ + %, fees/slippage, entry → exit liquidity, age at entry, balance before → after, duration + timestamps, portfolio totals (trades, win rate, total PnL, equity), per-chain and per-token lines for analysis, DexScreener link.
+- Close (📉 trailing / 🔴 stop / 🛑 early / 🛟 breakeven / ⏱ time): full pair + pool IDs, full token CA, entry → exit, high, TP hits, PnL $ + %, fees/slippage, entry → exit liquidity, age at entry, balance before → after, duration + timestamps, portfolio totals (trades, win rate, total PnL, equity), per-chain and per-token lines for analysis, DexScreener link.
 
 Verbosity is intentionally minimal: only BUY + CLOSE are sent (`TELEGRAM_ANNOUNCE_CANDIDATES=false`, `TELEGRAM_TRADE_UPDATES=false`). Candidate "NEW PAIR" pings and interim 💰 TP / 🛟 breakeven / 📈 trailing messages stay in the daemon logs; set the flags to `true` to receive them on Telegram too.
 

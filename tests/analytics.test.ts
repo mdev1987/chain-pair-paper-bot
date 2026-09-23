@@ -8,7 +8,14 @@ import {
   initAnalytics,
   recordFill,
   recordTrade,
+  tradeRecordFromPosition,
 } from "../src/analytics.ts";
+import {
+  openPosition,
+  totalPnlPct,
+  totalPnlUsd,
+  updatePosition,
+} from "../src/position.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "paperbot-duckdb-"));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -55,6 +62,9 @@ describe("duckdb trade ledger", () => {
       reason: "TRAIL_EXIT", tpLevels: "1", feesUsd: 0, slipUsd: 0,
       balanceBeforeUsd: 10_000, balanceAfterUsd: 9_998.5,
       entryLiquidityUsd: 20_000, exitLiquidityUsd: 18_500, entryAgeS: 60,
+      netPnlUsd: -1.7, costModel: "NET_PNL_100BPS_1PCT",
+      mfePct: 30, maePct: -20, exitPct: -20, givebackPp: 50, timeToMfeS: 1,
+      timeToMaeS: 2,
     });
 
     const fills = await analyticsQuery<Record<string, unknown>>(
@@ -70,17 +80,68 @@ describe("duckdb trade ledger", () => {
     assert.equal(fills[0]!.ca, "TOKENADDR123456789");
 
     const trades = await analyticsQuery<Record<string, unknown>>(
-      "SELECT symbol, reason, pnl_usd, tp_levels, entry_liquidity_usd FROM trades",
+      "SELECT symbol, reason, pnl_usd, tp_levels, entry_liquidity_usd, net_pnl_usd, cost_model, mfe_pct, mae_pct, exit_pct, giveback_pp, time_to_mfe_s, time_to_mae_s FROM trades",
     );
     assert.equal(trades.length, 1);
     assert.equal(trades[0]!.reason, "TRAIL_EXIT");
     assert.equal(trades[0]!.pnl_usd, -1.5);
     assert.equal(trades[0]!.tp_levels, "1");
     assert.equal(trades[0]!.entry_liquidity_usd, 20_000);
+    // Shadow + path columns persist alongside gross PnL.
+    assert.equal(trades[0]!.net_pnl_usd, -1.7);
+    assert.equal(trades[0]!.cost_model, "NET_PNL_100BPS_1PCT");
+    assert.equal(trades[0]!.mfe_pct, 30);
+    assert.equal(trades[0]!.mae_pct, -20);
+    assert.equal(trades[0]!.exit_pct, -20);
+    assert.equal(trades[0]!.giveback_pp, 50);
+    assert.equal(Number(trades[0]!.time_to_mfe_s), 1);
+    assert.equal(Number(trades[0]!.time_to_mae_s), 2);
 
     const wins = await analyticsQuery<{ wins: number | bigint }>(
       "SELECT count(*) FILTER (WHERE pnl_usd > 0) AS wins FROM trades",
     );
     assert.equal(Number(wins[0]!.wins), 0);
+  });
+});
+
+describe("trade path record", () => {
+  test("tradeRecordFromPosition derives shadow net and MFE/MAE/giveback", () => {
+    const position = openPosition({
+      id: "solana:PATH",
+      chain: "solana",
+      pairAddress: "PAIR",
+      tokenAddress: "TOKEN",
+      symbol: "PATH",
+      tokenName: "Path",
+      quoteSymbol: "SOL",
+      dexId: "raydium",
+      marketPrice: 1,
+      usdSize: 100,
+      now: 0,
+    });
+    updatePosition(position, 1.3, 1_000); // TP1 + trailing activates
+    updatePosition(position, 0.9, 2_000); // trails out at the low
+    assert.equal(position.status, "CLOSED");
+
+    const record = tradeRecordFromPosition(position, {
+      pnlUsd: totalPnlUsd(position),
+      pnlPct: totalPnlPct(position),
+      balanceBeforeUsd: 10_000,
+      balanceAfterUsd: 10_000,
+    });
+
+    // Path: high 1.3 (+30%), low/exit 0.9 (-10%).
+    assert.ok(Math.abs(record.mfePct - 30) < 1e-9);
+    assert.ok(Math.abs(record.maePct - -10) < 1e-9);
+    assert.ok(Math.abs(record.exitPct - -10) < 1e-9);
+    assert.ok(Math.abs(record.givebackPp - 40) < 1e-9);
+    assert.equal(record.timeToMfeS, 1);
+    assert.equal(record.timeToMaeS, 2);
+
+    // Shadow (100 bps + 1% per side): entry $100 → $2.00; TP1 25u @1.3 →
+    // $0.65; exit 75u @0.9 → $1.35. Gross is flat (7.5 - 7.5), net is -$4.
+    assert.equal(record.costModel, "NET_PNL_100BPS_1PCT");
+    assert.ok(Math.abs(totalPnlUsd(position) - 0) < 1e-9);
+    assert.ok(Math.abs(record.netPnlUsd - -4) < 1e-9);
   });
 });

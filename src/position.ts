@@ -1,12 +1,25 @@
 import { config } from "./config.ts";
 import type { Position } from "./types.ts";
 
+/**
+ * Shadow cost model for research (reported as NET_PNL_100BPS_1PCT).
+ * Convention, kept explicit so ledger rows are never ambiguous:
+ * modeled fee = 100 bps per side, modeled slippage = 1% per side,
+ * both applied to fill notional. Accrued on every fill into
+ * shadowFeeUsd/shadowSlipUsd and reported as net PnL in the ledger,
+ * but NEVER applied to the simulated cash balance.
+ */
+export const SHADOW_FEE_BPS = 100;
+export const SHADOW_SLIPPAGE_BPS = 100;
+export const SHADOW_COST_MODEL = "NET_PNL_100BPS_1PCT";
+
 export type PositionEvent =
   | { type: "TP"; level: 1 | 2 | 3; gainPct: number; sellPct: number; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number }
   | { type: "TRAIL_ACTIVATED"; price: number; trailStop: number }
   | { type: "STOP_MOVED"; mode: "BREAKEVEN"; price: number; stopPrice: number }
   | { type: "TRAIL_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
   | { type: "STOP_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
+  | { type: "EARLY_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
   | { type: "BREAKEVEN_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
   | { type: "TIME_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number };
 
@@ -30,6 +43,11 @@ export function initialStopPrice(position: Position): number {
   return position.entryPrice * (1 - config.stops.initialPct / 100);
 }
 
+/** Dead-on-arrival stop for fresh positions (tighter than the initial stop). */
+export function earlyStopPrice(position: Position): number {
+  return position.entryPrice * (1 - config.earlyStop.stopPct / 100);
+}
+
 export function breakevenStopPrice(position: Position): number {
   return position.entryPrice * (1 + config.dynamic.breakevenBufferPct / 100);
 }
@@ -38,7 +56,8 @@ export function trailingStopPrice(position: Position): number {
   return position.highestPrice * (1 - config.stops.trailDistancePct / 100);
 }
 
-/** Dynamic protective stop: trailing > breakeven (once TP1) > initial. */
+/** Dynamic protective stop: trailing > breakeven (once armed) > initial.
+ * The early stop is a separate time-windowed leg, not a standing price. */
 export function effectiveStopPrice(position: Position): number {
   if (position.trailingActive) return trailingStopPrice(position);
   if (position.breakevenArmed) return breakevenStopPrice(position);
@@ -60,6 +79,9 @@ function sellQuantity(
   position.realizedPnlUsd += grossPnl - fee;
   position.totalExitFeeUsd += fee;
   position.totalSlippageUsd += actualQty * Math.abs(fill - marketPrice);
+  // Shadow accrual on executed/quoted notional (research only, not cash).
+  position.shadowFeeUsd += actualQty * fill * (SHADOW_FEE_BPS / 10_000);
+  position.shadowSlipUsd += actualQty * marketPrice * (SHADOW_SLIPPAGE_BPS / 10_000);
   position.quantity -= actualQty;
   return { qty: actualQty, proceedsUsd: actualQty * fill - fee };
 }
@@ -118,6 +140,9 @@ export function openPosition(args: {
     entryPrice: fillPrice,
     currentPrice: args.marketPrice,
     highestPrice: args.marketPrice,
+    lowestPrice: args.marketPrice,
+    highestAt: now,
+    lowestAt: now,
     quantity,
     originalQuantity: quantity,
     initialUsdSize: args.usdSize,
@@ -126,6 +151,9 @@ export function openPosition(args: {
     totalEntryFeeUsd: entryFee,
     totalExitFeeUsd: 0,
     totalSlippageUsd: quantity * Math.abs(fillPrice - args.marketPrice),
+    // Shadow entry cost modeled on the full notional (research only).
+    shadowFeeUsd: args.usdSize * (SHADOW_FEE_BPS / 10_000),
+    shadowSlipUsd: args.usdSize * (SHADOW_SLIPPAGE_BPS / 10_000),
 
     openedAt: now,
     updatedAt: now,
@@ -151,10 +179,22 @@ export function updatePosition(
 
   position.currentPrice = marketPrice;
   position.updatedAt = now;
-  if (marketPrice > position.highestPrice) position.highestPrice = marketPrice;
+  // Full path tracking for MFE/MAE/giveback research (see tradeRecordFromPosition).
+  if (marketPrice > position.highestPrice) {
+    position.highestPrice = marketPrice;
+    position.highestAt = now;
+  }
+  if (marketPrice < position.lowestPrice) {
+    position.lowestPrice = marketPrice;
+    position.lowestAt = now;
+  }
 
   const events: PositionEvent[] = [];
   const gain = gainPct(position, marketPrice);
+  // Epsilon for threshold crossings: binary floats rarely land exactly on a
+  // boundary (e.g. 1.2x reads as +19.999999999996%), so compare tolerantly
+  // rather than letting the boundary be decided by rounding luck.
+  const EPS = 1e-9;
 
   for (let i = 0; i < config.tp.length; i++) {
     const level = config.tp[i]!;
@@ -162,7 +202,7 @@ export function updatePosition(
     // Order-independent: a level below the current gain must not block
     // later levels when TP gains are misordered. Startup config validation
     // requires strictly ascending gains; this loop stays correct regardless.
-    if (gain < level.gainPct) continue;
+    if (gain + EPS < level.gainPct) continue;
 
     const { qty: sold, proceedsUsd } = sellQuantity(
       position,
@@ -185,11 +225,13 @@ export function updatePosition(
     }
   }
 
-  // Dynamic SL leg 1: after TP1, ratchet protection to breakeven (+ buffer).
+  // Dynamic SL leg 1: ratchet protection to breakeven (+ buffer) once the
+  // position shows strength — at BREAKEVEN_ARM_PCT gain, or after TP1 as a
+  // fallback — until the trailing stop takes over.
   if (
-    config.dynamic.breakevenAfterTp1 &&
     !position.breakevenArmed &&
-    position.tpHit[0] === true
+    (gain + EPS >= config.dynamic.breakevenArmPct ||
+      (config.dynamic.breakevenAfterTp1 && position.tpHit[0] === true))
   ) {
     position.breakevenArmed = true;
     events.push({
@@ -200,7 +242,7 @@ export function updatePosition(
     });
   }
 
-  if (!position.trailingActive && gain >= config.stops.trailActivationPct) {
+  if (!position.trailingActive && gain + EPS >= config.stops.trailActivationPct) {
     position.trailingActive = true;
     events.push({ type: "TRAIL_ACTIVATED", price: marketPrice, trailStop: trailingStopPrice(position) });
   }
@@ -208,6 +250,8 @@ export function updatePosition(
   const trailingStop = trailingStopPrice(position);
   const breakevenStop = breakevenStopPrice(position);
   const initialStop = initialStopPrice(position);
+  const earlyStop = earlyStopPrice(position);
+  const withinEarlyWindow = now - position.openedAt < config.earlyStop.windowSec * 1000;
 
   if (position.trailingActive && marketPrice <= trailingStop) {
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "TRAIL_EXIT", now);
@@ -219,6 +263,15 @@ export function updatePosition(
   ) {
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "BREAKEVEN_STOP", now);
     events.push({ type: "BREAKEVEN_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
+  } else if (
+    config.earlyStop.enabled &&
+    !position.trailingActive &&
+    !position.breakevenArmed &&
+    withinEarlyWindow &&
+    marketPrice <= earlyStop
+  ) {
+    const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "EARLY_STOP", now);
+    events.push({ type: "EARLY_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
   } else if (!position.trailingActive && !position.breakevenArmed && marketPrice <= initialStop) {
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "STOP_EXIT", now);
     events.push({ type: "STOP_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
