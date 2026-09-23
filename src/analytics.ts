@@ -4,6 +4,23 @@ import type { Position } from "./types.ts";
 
 type DuckDBConnection = import("@duckdb/node-api").DuckDBConnection;
 
+export interface QuoteCheckRecord {
+  time: number;
+  positionId: string;
+  chain: string;
+  side: "BUY" | "SELL";
+  /** Adapter name, or "skipped" when no quote was attempted. */
+  source: string;
+  paperPriceUsd: number;
+  quotedSellAmount: string;
+  quotedBuyAmount: string;
+  sellDecimals: number | null;
+  buyDecimals: number | null;
+  riskPass: boolean | null;
+  simOk: boolean | null;
+  note: string;
+}
+
 export interface PositionSnapshotTick {
   time: number;
   positionId: string;
@@ -15,7 +32,8 @@ export interface PositionSnapshotTick {
   txnsJson: string;
 }
 
-export interface FillRecord {  time: number;
+export interface FillRecord {
+  time: number;
   side: "BUY" | "SELL";
   positionId: string;
   chain: string;
@@ -107,6 +125,17 @@ const SNAPSHOTS_DDL = `CREATE TABLE IF NOT EXISTS position_snapshots (
   price DOUBLE, liquidity_usd DOUBLE, txns_json VARCHAR
 )`;
 
+// Parallel real-quote diagnostics for every paper fill (simulation stage).
+// The paper engine never reads this table — it exists to measure how far
+// live-executable quotes and eth_call simulations deviate from paper marks.
+const QUOTE_CHECKS_DDL = `CREATE TABLE IF NOT EXISTS quote_checks (
+  time BIGINT, position_id VARCHAR, chain VARCHAR, side VARCHAR,
+  source VARCHAR, paper_price_usd DOUBLE,
+  quoted_sell_amount VARCHAR, quoted_buy_amount VARCHAR,
+  sell_decimals INTEGER, buy_decimals INTEGER,
+  risk_pass BOOLEAN, sim_ok BOOLEAN, note VARCHAR
+)`;
+
 const TRADES_DDL = `CREATE TABLE IF NOT EXISTS trades (
   position_id VARCHAR, chain VARCHAR, dex VARCHAR, symbol VARCHAR,
   token_name VARCHAR, pair VARCHAR, pool VARCHAR, ca VARCHAR, quote VARCHAR,
@@ -173,6 +202,7 @@ async function openConnection(dbPath: string): Promise<DuckDBConnection> {
   await connection.run(FILLS_DDL);
   await connection.run(TRADES_DDL);
   await connection.run(SNAPSHOTS_DDL);
+  await connection.run(QUOTE_CHECKS_DDL);
   for (const column of TRADES_MIGRATION_COLUMNS) {
     const name = column.split(" ")[0]!;
     await connection.run(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS ${name} ${column.slice(name.length + 1)}`);
@@ -259,6 +289,27 @@ export async function recordSnapshot(tick: PositionSnapshotTick): Promise<void> 
       [
         tick.time, tick.positionId, tick.chain, tick.symbol,
         tick.price, tick.liquidityUsd, tick.txnsJson,
+      ],
+    );
+  } catch (error) {
+    failure = String(error);
+    conn = null;
+    initPromise = null;
+  }
+}
+
+/** Append a parallel real-quote diagnostic for a paper fill. Best-effort. */
+export async function recordQuoteCheck(check: QuoteCheckRecord): Promise<void> {
+  const c = await ensure();
+  if (!c) return;
+  try {
+    await c.run(
+      `INSERT INTO quote_checks VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [
+        check.time, check.positionId, check.chain, check.side, check.source,
+        check.paperPriceUsd, check.quotedSellAmount, check.quotedBuyAmount,
+        check.sellDecimals, check.buyDecimals, check.riskPass, check.simOk,
+        check.note,
       ],
     );
   } catch (error) {

@@ -21,6 +21,7 @@ import {
   closeAnalytics,
   initAnalytics,
   recordFill,
+  recordQuoteCheck,
   recordSnapshot,
   recordTrade,
   tradeRecordFromPosition,
@@ -36,6 +37,15 @@ import {
 } from "./report.ts";
 import type { Candidate, DexScreenerPair, Position } from "./types.ts";
 import { telegram, testTelegram } from "./telegram.ts";
+import {
+  KNOWN_QUOTE_DECIMALS,
+  qtyToBaseUnits,
+  quotePriceUsd,
+  resolveTokenDecimals,
+  SIM_ZERO_TAKER,
+  simulateSwap,
+} from "./execution/simulate.ts";
+import { EVM_CHAIN_IDS } from "./execution/evm/viem-client.ts";
 
 const seenPools = new Map<string, number>();
 const candidates = new Map<string, Candidate>();
@@ -193,6 +203,119 @@ async function announceBuy(position: Position): Promise<void> {
     openCount: positions.size,
     maxOpen: config.entry.maxOpenPositions,
   }));
+}
+
+/**
+ * Parallel real-quote diagnostics (simulation stage). Runs AFTER the paper
+ * bookkeeping is complete and NEVER gates trading — every failure is caught,
+ * logged, and ledgered as a skip. Feeds the fill-vs-mark dataset that
+ * decides whether the strategy transfers to live execution.
+ */
+function simTaker(): string {
+  return process.env.SIM_TAKER_ADDRESS ?? SIM_ZERO_TAKER;
+}
+
+function chainIdFor(chain: string): number | undefined {
+  return EVM_CHAIN_IDS[chain];
+}
+
+async function recordEntryQuoteCheck(
+  position: Position,
+  activePair: DexScreenerPair,
+  entryPrice: number,
+  sizeUsd: number,
+): Promise<void> {
+  const base = {
+    time: Date.now(),
+    positionId: position.id,
+    chain: position.chain,
+    side: "BUY" as const,
+    paperPriceUsd: entryPrice,
+  };
+  try {
+    const quoteSymbol = activePair.quoteToken.symbol;
+    const qp = quotePriceUsd(entryPrice, Number(activePair.priceNative ?? "NaN"), quoteSymbol);
+    const qd = KNOWN_QUOTE_DECIMALS[quoteSymbol.toLowerCase()];
+    if (qp === null || qd === undefined) {
+      await recordQuoteCheck({
+        ...base, source: "skipped", quotedSellAmount: "", quotedBuyAmount: "",
+        sellDecimals: null, buyDecimals: null, riskPass: null, simOk: null,
+        note: qp === null ? "quote-price-unknown" : `decimals-unknown:${quoteSymbol}`,
+      });
+      return;
+    }
+    const chainId = chainIdFor(position.chain);
+    const result = await simulateSwap({
+      chain: position.chain,
+      ...(chainId !== undefined ? { chainId } : {}),
+      side: "BUY",
+      sellToken: activePair.quoteToken.address,
+      buyToken: position.tokenAddress,
+      sellAmountBaseUnits: qtyToBaseUnits(sizeUsd / qp, qd),
+      sellDecimals: qd,
+      buyDecimals: null,
+      pairAddress: activePair.pairAddress,
+      taker: simTaker(),
+      slippageBps: 100,
+    });
+    await recordQuoteCheck({
+      ...base, source: result.source,
+      quotedSellAmount: result.quotedSellAmount, quotedBuyAmount: result.quotedBuyAmount,
+      sellDecimals: qd, buyDecimals: null,
+      riskPass: result.riskPass, simOk: result.simOk, note: result.note,
+    });
+  } catch (error) {
+    log(`⚠️ entry quote-check ${position.id}: ${String(error).slice(0, 150)}`);
+  }
+}
+
+async function recordExitQuoteCheck(
+  position: Position,
+  pair: DexScreenerPair,
+  soldQty: number,
+  exitPrice: number,
+): Promise<void> {
+  const base = {
+    time: Date.now(),
+    positionId: position.id,
+    chain: position.chain,
+    side: "SELL" as const,
+    paperPriceUsd: exitPrice,
+  };
+  try {
+    const tokenDec = await resolveTokenDecimals(position.chain, position.tokenAddress);
+    const qd = KNOWN_QUOTE_DECIMALS[position.quoteSymbol.toLowerCase()];
+    if (tokenDec === null) {
+      await recordQuoteCheck({
+        ...base, source: "skipped", quotedSellAmount: "", quotedBuyAmount: "",
+        sellDecimals: null, buyDecimals: qd ?? null, riskPass: null, simOk: null,
+        note: "token-decimals-unavailable",
+      });
+      return;
+    }
+    const chainId = chainIdFor(position.chain);
+    const result = await simulateSwap({
+      chain: position.chain,
+      ...(chainId !== undefined ? { chainId } : {}),
+      side: "SELL",
+      sellToken: position.tokenAddress,
+      buyToken: pair.quoteToken.address,
+      sellAmountBaseUnits: qtyToBaseUnits(soldQty, tokenDec),
+      sellDecimals: tokenDec,
+      buyDecimals: qd ?? null,
+      pairAddress: position.pairAddress,
+      taker: simTaker(),
+      slippageBps: 100,
+    });
+    await recordQuoteCheck({
+      ...base, source: result.source,
+      quotedSellAmount: result.quotedSellAmount, quotedBuyAmount: result.quotedBuyAmount,
+      sellDecimals: tokenDec, buyDecimals: qd ?? null,
+      riskPass: result.riskPass, simOk: result.simOk, note: result.note,
+    });
+  } catch (error) {
+    log(`⚠️ exit quote-check ${position.id}: ${String(error).slice(0, 150)}`);
+  }
 }
 
 async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchNewestPools>>[number], pair: DexScreenerPair): Promise<void> {
@@ -353,6 +476,8 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
     detail: "OPEN",
     balanceAfterUsd: portfolio.cashUsd,
   });
+  // Parallel real-quote diagnostic (simulation only — paper already booked).
+  await recordEntryQuoteCheck(position, activePair, entryPrice, sizeUsd);
   await announceBuy(position);
 }
 
@@ -546,6 +671,8 @@ async function trackPositions(): Promise<void> {
                 balanceBeforeUsd: position.balanceBeforeUsd ?? position.balanceAfterUsd,
                 balanceAfterUsd: position.balanceAfterUsd,
               }));
+              // Parallel real-quote diagnostic for the actual exit fill.
+              await recordExitQuoteCheck(position, pair, event.soldQty, event.price);
               const snapshot = portfolio.snapshot(positions.values());
               const chainStat = portfolio.chainStat(position.chain);
               const tokenStat = portfolio.tokenPnlUsd(position.chain, position.symbol);

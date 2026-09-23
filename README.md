@@ -124,6 +124,30 @@ console.log(await analyticsQuery(`
   FROM trades GROUP BY chain, symbol, ca ORDER BY pnl_usd DESC LIMIT 20`));
 ```
 
+## Execution layer (simulation stage)
+
+`src/execution/` implements one `SwapExecutor` interface (quoteBuy/quoteSell/simulate/buy/sell) that the paper engine does **not** use yet — it keeps filling virtually at observed prices. The module is the Stage-1 foundation:
+
+```text
+src/execution/
+├── types.ts        SwapExecutor, Quote, RiskPolicy, live-spend gate
+├── risk.ts         pure RISK GATE (impact / tax / output / gas)
+├── paper.ts        virtual executor (mark-price fills, for tests/dry runs)
+├── evm/
+│   ├── router.ts       aggregator-first routing, direct-DEX fallback
+│   ├── zeroex.ts       0x Swap API quoter (primary EVM)
+│   ├── uniswap.ts      direct on-chain V2 quoting (EVM fallback)
+│   ├── pancakeswap.ts  stub (Stage 1: Smart Router)
+│   ├── viem-client.ts  RPC/wallet clients (incl. Robinhood Chain 4663)
+│   └── simulator.ts    eth_call simulation (Tenderly remains optional)
+└── solana/
+    └── jupiter.ts  Jupiter Swap V2 /order quoter (Meta-Aggregator)
+```
+
+Rules: quote/simulate are read-only and safe; network buy/sell throw unless `LIVE_TRADING_ENABLED=true` with a configured key. Fresh-pool reality is baked in — unquotable routes and Jupiter `transaction: ""` responses are normal routing signals handled by fallback, not errors. The Uniswap adapter deliberately avoids the hosted Trading API: since DexPaprika discovery already yields the exact pair contract, it reads `token0`/`getReserves` on-chain and applies constant-product math locally (viem + two minimal ABIs, no Uniswap SDK dependency yet — reach for `@uniswap/sdk-core` + v2/v3/v4 SDKs if multi-hop or concentrated-liquidity Quoter flows are ever needed).
+
+Live simulation is already running: every paper BUY and final exit additionally fetches a real executable quote (Jupiter on Solana; 0x → direct-V2 on EVM) plus an eth_call simulation where calldata exists, and records the outcome in `quote_checks` — quoted amounts, risk verdict, sim result. The paper engine never reads that table; it is the fill-vs-mark dataset that decides whether the strategy transfers live. Entries spend known quote currencies (decimals mapped); EVM exits resolve token decimals on-chain; Solana exits are skipped until a token-decimals source is wired. Note the Jupiter cost detail this surfaced: `/order` charges **50 bps platform fee on new tokens** (<24h old, i.e. everything this bot trades), so live Solana cost is ≥50 bps/side before slippage — inside the `NET_PNL_100BPS_1PCT` shadow model, but barely.
+
 ## Paper friction
 
 The paper engine supports:
