@@ -254,6 +254,7 @@ export function updatePosition(
   const withinEarlyWindow = now - position.openedAt < config.earlyStop.windowSec * 1000;
 
   if (position.trailingActive && marketPrice <= trailingStop) {
+    position.exitTriggerPrice = trailingStop;
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "TRAIL_EXIT", now);
     events.push({ type: "TRAIL_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
   } else if (
@@ -261,6 +262,7 @@ export function updatePosition(
     position.breakevenArmed &&
     marketPrice <= breakevenStop
   ) {
+    position.exitTriggerPrice = breakevenStop;
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "BREAKEVEN_STOP", now);
     events.push({ type: "BREAKEVEN_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
   } else if (
@@ -270,12 +272,15 @@ export function updatePosition(
     withinEarlyWindow &&
     marketPrice <= earlyStop
   ) {
+    position.exitTriggerPrice = earlyStop;
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "EARLY_STOP", now);
     events.push({ type: "EARLY_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
   } else if (!position.trailingActive && !position.breakevenArmed && marketPrice <= initialStop) {
+    position.exitTriggerPrice = initialStop;
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "STOP_EXIT", now);
     events.push({ type: "STOP_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
   } else if (now - position.openedAt >= config.entry.maxPositionAgeMin * 60_000) {
+    position.exitTriggerPrice = marketPrice;
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "TIME_EXIT", now);
     events.push({ type: "TIME_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
   }

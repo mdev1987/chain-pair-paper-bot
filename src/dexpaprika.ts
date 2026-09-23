@@ -90,7 +90,12 @@ export async function fetchNewestPools(chain: string): Promise<DiscoveredPool[]>
     orderBy: "created_at",
   }) as unknown as SearchResponse;
 
-  const cutoffMs = Date.now() - config.dexPaprika.maxAgeSec * 1000;
+  const now = Date.now();
+  // Too old = missed the window (reject outright). Too young = early price
+  // discovery unfinished — excluded now, but the pool is NOT marked seen so
+  // a later cycle picks it up once it ages into the band ("wait" semantics).
+  const tooOldMs = now - config.dexPaprika.maxAgeSec * 1000;
+  const tooYoungMs = now - config.dexPaprika.minAgeSec * 1000;
 
   return response.results
     .map((pool) => {
@@ -111,8 +116,10 @@ export async function fetchNewestPools(chain: string): Promise<DiscoveredPool[]>
         })),
       } satisfies DiscoveredPool;
     })
-    .filter((pool) => pool.createdAtMs >= cutoffMs)
+    .filter((pool) => pool.createdAtMs >= tooOldMs)
+    .filter((pool) => pool.createdAtMs <= tooYoungMs)
     .filter((pool) => pool.liquidityUsd >= config.dexPaprika.minLiquidityUsd)
+    .filter((pool) => pool.liquidityUsd <= config.dexPaprika.maxLiquidityUsd)
     .filter((pool) => pool.volume24hUsd >= config.dexPaprika.minVolume24hUsd)
     .filter((pool) => pool.txns24h >= config.dexPaprika.minTxns24h);
 }

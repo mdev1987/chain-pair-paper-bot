@@ -80,6 +80,39 @@ export function parsePrice(pair: DexScreenerPair): number | null {
   return Number.isFinite(price) && price > 0 ? price : null;
 }
 
+export interface ConfirmationQuote {
+  price: number;
+  liquidityUsd: number;
+}
+
+/**
+ * Two-snapshot entry confirmation (pure, unit-tested). Compares a re-quote
+ * against the qualifying observation and rejects only deterioration: a
+ * material price slide or liquidity collapse means the pool has already
+ * begun failing. Rising/flat prints always pass — this is not momentum.
+ */
+export function assessConfirmation(
+  first: ConfirmationQuote,
+  second: ConfirmationQuote,
+  maxPriceDropPct: number,
+  maxLiqDropPct: number,
+): { ok: boolean; reason?: string } {
+  if (!Number.isFinite(second.price) || second.price <= 0) {
+    return { ok: false, reason: "no-price" };
+  }
+  const priceDropPct = ((first.price - second.price) / first.price) * 100;
+  if (priceDropPct > maxPriceDropPct) {
+    return { ok: false, reason: `price-declining ${priceDropPct.toFixed(1)}%` };
+  }
+  const liqDropPct = first.liquidityUsd > 0
+    ? ((first.liquidityUsd - second.liquidityUsd) / first.liquidityUsd) * 100
+    : 0;
+  if (liqDropPct > maxLiqDropPct) {
+    return { ok: false, reason: `liquidity-collapsing ${liqDropPct.toFixed(1)}%` };
+  }
+  return { ok: true };
+}
+
 export function pairLiquidityUsd(pair: DexScreenerPair): number {
   const value = Number(pair.liquidity?.usd ?? 0);
   return Number.isFinite(value) ? value : 0;

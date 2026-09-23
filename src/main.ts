@@ -1,6 +1,12 @@
 import { config } from "./config.ts";
 import { fetchNewestPools } from "./dexpaprika.ts";
-import { getPairsByChain, parsePrice, pairLiquidityUsd } from "./dexscreener.ts";
+import {
+  assessConfirmation,
+  getPair,
+  getPairsByChain,
+  parsePrice,
+  pairLiquidityUsd,
+} from "./dexscreener.ts";
 import {
   effectiveStopPrice,
   totalPnlPct,
@@ -15,6 +21,7 @@ import {
   closeAnalytics,
   initAnalytics,
   recordFill,
+  recordSnapshot,
   recordTrade,
   tradeRecordFromPosition,
 } from "./analytics.ts";
@@ -38,6 +45,10 @@ const portfolio = new Portfolio(config.portfolio.initialBalanceUsd);
 // Cumulative fee/slippage already attributed to the ledger, per position.
 // Lets partial fills record incremental (delta) costs instead of totals.
 const ledgerCosts = new Map<string, { fee: number; slip: number }>();
+
+// Last per-minute market snapshot per open position (late-gap research).
+// Entries die with the position, so the map stays bounded by open count.
+const lastSnapshotAt = new Map<string, number>();
 
 // --- Positions recovery: state.json is the source of truth for open
 // positions, cash and closed-trade history across restarts. Saves are
@@ -191,7 +202,13 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
   const price = parsePrice(pair);
   if (price === null) return;
   if (!isAllowedQuote(pair) || !isAllowedDex(pair)) return;
-  if (pairLiquidityUsd(pair) < config.dexPaprika.minLiquidityUsd) return;
+  // Fresh-quote liquidity band: DexPaprika rows can be stale, so re-apply
+  // the $15k–$100k band against the DexScreener print before entering.
+  const liquidity = pairLiquidityUsd(pair);
+  if (
+    liquidity < config.dexPaprika.minLiquidityUsd ||
+    liquidity > config.dexPaprika.maxLiquidityUsd
+  ) return;
 
   const token = chooseCandidateToken(pair);
   const candidate: Candidate = {
@@ -216,7 +233,7 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
 
   log(
     `🆕 ${chain} ${candidate.tokenSymbol} ${short(candidate.poolAddress)} ` +
-    `price=$${price.toPrecision(8)} liq=$${pairLiquidityUsd(pair).toFixed(0)}`,
+    `price=$${price.toPrecision(8)} liq=$${liquidity.toFixed(0)}`,
   );
   if (config.telegram.announceCandidates) {
     await announceCandidate(candidate, price);
@@ -225,17 +242,56 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
   if (!config.entry.auto) return;
   if (positions.size >= config.entry.maxOpenPositions) return;
 
+  // Per-chain sizing (uniform POSITION_SIZE_USD unless CHAIN_POSITION_SIZES
+  // overrides this chain). Resolved once so the impact guard, reserve, fill
+  // record and position all agree on the same notional.
+  const sizeUsd = config.entry.chainSizes.get(chain) ?? config.entry.positionSizeUsd;
+
   // Pre-entry exitability guard: skip pools where our own paper exit would
   // move the price (estimated against half the venue liquidity). Logs and
   // retries are handled by the caller — this only gates new entries.
-  const entryLiquidity = pairLiquidityUsd(pair);
-  const impactPct = (config.entry.positionSizeUsd / Math.max(1, entryLiquidity / 2)) * 100;
+  const impactPct = (sizeUsd / Math.max(1, liquidity / 2)) * 100;
   if (impactPct > config.entry.maxImpactPct) {
     log(`⏭️ skip entry ${chain}:${pair.pairAddress}: est. impact ${impactPct.toFixed(2)}% > ${config.entry.maxImpactPct}%`);
     return;
   }
 
-  const positionId = `${chain}:${pair.pairAddress}`;
+  // Two-snapshot confirmation: re-quote after a short delay and enter on the
+  // second print. Rejects pools already sliding or draining; rising/flat
+  // prints pass freely (no momentum requirement).
+  let activePair = pair;
+  let entryPrice = price;
+  let entryLiquidity = liquidity;
+  if (config.entry.confirmEnabled) {
+    await new Promise((resolve) => setTimeout(resolve, config.entry.confirmDelayMs));
+    let fresh: DexScreenerPair | null = null;
+    try {
+      fresh = await getPair(chain, pair.pairAddress);
+    } catch (error) {
+      log(`⏭️ skip entry ${chain}:${pair.pairAddress}: re-quote failed (${String(error)})`);
+      return;
+    }
+    if (!fresh) {
+      log(`⏭️ skip entry ${chain}:${pair.pairAddress}: vanished on re-quote`);
+      return;
+    }
+    const freshPrice = parsePrice(fresh);
+    const verdict = assessConfirmation(
+      { price, liquidityUsd: liquidity },
+      { price: freshPrice ?? NaN, liquidityUsd: pairLiquidityUsd(fresh) },
+      config.entry.confirmMaxPriceDropPct,
+      config.entry.confirmMaxLiqDropPct,
+    );
+    if (!verdict.ok || freshPrice === null) {
+      log(`⏭️ skip entry ${chain}:${pair.pairAddress}: confirm failed (${verdict.reason ?? "no-price"})`);
+      return;
+    }
+    activePair = fresh;
+    entryPrice = freshPrice;
+    entryLiquidity = pairLiquidityUsd(fresh);
+  }
+
+  const positionId = `${chain}:${activePair.pairAddress}`;
   if (positions.has(positionId)) return;
   if (config.entry.oneEntryPerPool && portfolio.closedTrades.some((t) => t.id === positionId)) {
     log(`⏭️ skip re-entry ${positionId}: already traded (ONE_ENTRY_PER_POOL)`);
@@ -243,29 +299,30 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
   }
 
   const balanceBefore = portfolio.equityUsd(positions.values());
-  if (!portfolio.canOpen(config.entry.positionSizeUsd)) {
+  if (!portfolio.canOpen(sizeUsd)) {
     log(`⚠️ skip entry ${positionId}: insufficient cash $${portfolio.cashUsd.toFixed(2)}`);
     return;
   }
 
+  const entryToken = chooseCandidateToken(activePair);
   const position = openPosition({
     id: positionId,
     chain,
-    pairAddress: pair.pairAddress,
-    tokenAddress: token.address,
-    symbol: token.symbol,
-    tokenName: token.name,
-    quoteSymbol: pair.quoteToken.symbol,
-    dexId: pair.dexId,
-    pairUrl: pair.url,
-    marketPrice: price,
-    usdSize: config.entry.positionSizeUsd,
+    pairAddress: activePair.pairAddress,
+    tokenAddress: entryToken.address,
+    symbol: entryToken.symbol,
+    tokenName: entryToken.name,
+    quoteSymbol: activePair.quoteToken.symbol,
+    dexId: activePair.dexId,
+    pairUrl: activePair.url,
+    marketPrice: entryPrice,
+    usdSize: sizeUsd,
     balanceBeforeUsd: balanceBefore,
     poolAddress: pool.poolAddress,
-    entryLiquidityUsd: pairLiquidityUsd(pair),
+    entryLiquidityUsd: entryLiquidity,
     entryAgeSec: ageSeconds(pool.createdAtMs),
   });
-  portfolio.onOpen(config.entry.positionSizeUsd);
+  portfolio.onOpen(sizeUsd);
 
   positions.set(positionId, position);
   // Fee/slippage baseline for incremental per-fill attribution. The fee
@@ -290,7 +347,7 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
     quote: position.quoteSymbol,
     price: position.entryPrice,
     qty: position.quantity,
-    notionalUsd: config.entry.positionSizeUsd,
+    notionalUsd: sizeUsd,
     feeUsd: position.totalEntryFeeUsd,
     slipUsd: position.totalSlippageUsd,
     detail: "OPEN",
@@ -459,6 +516,7 @@ async function trackPositions(): Promise<void> {
               positions.delete(position.id);
               const prev = ledgerCosts.get(position.id) ?? { fee: position.totalEntryFeeUsd, slip: 0 };
               ledgerCosts.delete(position.id);
+              lastSnapshotAt.delete(position.id);
               position.balanceAfterUsd = portfolio.equityUsd(positions.values());
               persist(true);
               // Analytics is internally best-effort; reporting via notify.
@@ -503,6 +561,25 @@ async function trackPositions(): Promise<void> {
           }
         }
 
+        // Per-minute market snapshot for the late-gap study (research only,
+        // never an exit signal). Skipped for positions that just closed —
+        // their close record already carries the final print.
+        if (position.status === "OPEN") {
+          const tickNow = Date.now();
+          if (tickNow - (lastSnapshotAt.get(position.id) ?? 0) >= config.snapshots.intervalS * 1000) {
+            lastSnapshotAt.set(position.id, tickNow);
+            await recordSnapshot({
+              time: tickNow,
+              positionId: position.id,
+              chain: position.chain,
+              symbol: position.symbol,
+              price,
+              liquidityUsd: pairLiquidityUsd(pair),
+              txnsJson: JSON.stringify(pair.txns ?? null),
+            });
+          }
+        }
+
         // Safety net: position closed without a matching exit event
         // should never happen, but never leak a dead position.
         if ((position.status as string) === "CLOSED" && positions.has(position.id)) {
@@ -513,6 +590,7 @@ async function trackPositions(): Promise<void> {
             portfolio.onClose(position);
           }
           positions.delete(position.id);
+          lastSnapshotAt.delete(position.id);
           persist(true);
         }
       }
@@ -543,11 +621,17 @@ async function main(): Promise<void> {
   console.log("============================================");
   console.log(`Mode                : ${config.mode}`);
   console.log(`Chains              : ${config.dexPaprika.chains.join(", ")}`);
+  console.log(`Entry band          : age ${config.dexPaprika.minAgeSec}-${config.dexPaprika.maxAgeSec}s, ` +
+    `liq $${config.dexPaprika.minLiquidityUsd.toLocaleString()}-$${config.dexPaprika.maxLiquidityUsd.toLocaleString()}, ` +
+    `confirm ${config.entry.confirmEnabled ? `on (${config.entry.confirmDelayMs}ms)` : "off"}`);
   console.log(`Discovery interval  : ${config.dexPaprika.intervalMs}ms`);
   console.log(`Price interval      : ${config.dexScreener.intervalMs}ms`);
   console.log(`DexScreener RPM cap : ${config.dexScreener.maxRpm}`);
   console.log(`Auto entry          : ${config.entry.auto}`);
-  console.log(`Position size       : $${config.entry.positionSizeUsd}`);
+  console.log(`Position size       : $${config.entry.positionSizeUsd}` +
+    (config.entry.chainSizes.size > 0
+      ? ` (overrides: ${[...config.entry.chainSizes.entries()].map(([c, s]) => `${c}=$${s}`).join(", ")})`
+      : ""));
   console.log(`Initial balance     : $${config.portfolio.initialBalanceUsd}`);
   console.log(`Max positions       : ${config.entry.maxOpenPositions}`);
   console.log(`Telegram            : ${config.telegram.enabled}`);

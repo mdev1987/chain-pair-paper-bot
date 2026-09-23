@@ -7,6 +7,7 @@ import {
   analyticsQuery,
   initAnalytics,
   recordFill,
+  recordSnapshot,
   recordTrade,
   tradeRecordFromPosition,
 } from "../src/analytics.ts";
@@ -64,7 +65,8 @@ describe("duckdb trade ledger", () => {
       entryLiquidityUsd: 20_000, exitLiquidityUsd: 18_500, entryAgeS: 60,
       netPnlUsd: -1.7, costModel: "NET_PNL_100BPS_1PCT",
       mfePct: 30, maePct: -20, exitPct: -20, givebackPp: 50, timeToMfeS: 1,
-      timeToMaeS: 2,
+      timeToMaeS: 2, exitTriggerPct: -15, gapThroughStop: true,
+      modeledFeeUsd: 0.1, modeledSlipUsd: 0.1,
     });
 
     const fills = await analyticsQuery<Record<string, unknown>>(
@@ -80,7 +82,7 @@ describe("duckdb trade ledger", () => {
     assert.equal(fills[0]!.ca, "TOKENADDR123456789");
 
     const trades = await analyticsQuery<Record<string, unknown>>(
-      "SELECT symbol, reason, pnl_usd, tp_levels, entry_liquidity_usd, net_pnl_usd, cost_model, mfe_pct, mae_pct, exit_pct, giveback_pp, time_to_mfe_s, time_to_mae_s FROM trades",
+      "SELECT symbol, reason, pnl_usd, tp_levels, entry_liquidity_usd, net_pnl_usd, cost_model, mfe_pct, mae_pct, exit_pct, giveback_pp, time_to_mfe_s, time_to_mae_s, exit_trigger_pct, gap_through_stop, modeled_fee_usd, modeled_slip_usd FROM trades",
     );
     assert.equal(trades.length, 1);
     assert.equal(trades[0]!.reason, "TRAIL_EXIT");
@@ -96,11 +98,30 @@ describe("duckdb trade ledger", () => {
     assert.equal(trades[0]!.giveback_pp, 50);
     assert.equal(Number(trades[0]!.time_to_mfe_s), 1);
     assert.equal(Number(trades[0]!.time_to_mae_s), 2);
+    assert.equal(trades[0]!.exit_trigger_pct, -15);
+    assert.equal(trades[0]!.gap_through_stop, true);
+    assert.equal(trades[0]!.modeled_fee_usd, 0.1);
+    assert.equal(trades[0]!.modeled_slip_usd, 0.1);
 
     const wins = await analyticsQuery<{ wins: number | bigint }>(
       "SELECT count(*) FILTER (WHERE pnl_usd > 0) AS wins FROM trades",
     );
     assert.equal(Number(wins[0]!.wins), 0);
+  });
+
+  test("position snapshots round-trip for the late-gap study", async () => {
+    await recordSnapshot({
+      time: 5_000, positionId: "solana:PAIR", chain: "solana", symbol: "TEST",
+      price: 1.2, liquidityUsd: 19_000, txnsJson: '{"h1":{"buys":10,"sells":4}}',
+    });
+    const ticks = await analyticsQuery<Record<string, unknown>>(
+      "SELECT position_id, price, liquidity_usd, txns_json FROM position_snapshots",
+    );
+    assert.equal(ticks.length, 1);
+    assert.equal(ticks[0]!.position_id, "solana:PAIR");
+    assert.equal(ticks[0]!.price, 1.2);
+    assert.equal(ticks[0]!.liquidity_usd, 19_000);
+    assert.equal(ticks[0]!.txns_json, '{"h1":{"buys":10,"sells":4}}');
   });
 });
 
@@ -143,5 +164,69 @@ describe("trade path record", () => {
     assert.equal(record.costModel, "NET_PNL_100BPS_1PCT");
     assert.ok(Math.abs(totalPnlUsd(position) - 0) < 1e-9);
     assert.ok(Math.abs(record.netPnlUsd - -4) < 1e-9);
+    // Trail trigger was 1.04 (+4%) but the fill printed at 0.9 (-10%):
+    // a gap-through-stop with the modeled cost split stored separately.
+    assert.ok(Math.abs(record.exitTriggerPct - 4) < 1e-9);
+    assert.equal(record.gapThroughStop, true);
+    assert.ok(Math.abs(record.modeledFeeUsd - 2) < 1e-9);
+    assert.ok(Math.abs(record.modeledSlipUsd - 2) < 1e-9);
+  });
+
+  test("breakeven trigger with catastrophic fill flags the gap (CATO profile)", () => {
+    const position = openPosition({
+      id: "solana:GAP",
+      chain: "solana",
+      pairAddress: "PAIR",
+      tokenAddress: "TOKEN",
+      symbol: "GAP",
+      tokenName: "Gap",
+      quoteSymbol: "SOL",
+      dexId: "raydium",
+      marketPrice: 1,
+      usdSize: 100,
+      now: 0,
+    });
+    updatePosition(position, 1.25, 60_000); // arms breakeven (+25%, no TP/trail)
+    assert.equal(position.breakevenArmed, true);
+    updatePosition(position, 0.05, 120_000); // gap far through the stop
+    assert.equal(position.closedReason, "BREAKEVEN_STOP");
+
+    const record = tradeRecordFromPosition(position, {
+      pnlUsd: totalPnlUsd(position),
+      pnlPct: totalPnlPct(position),
+      balanceBeforeUsd: 10_000,
+      balanceAfterUsd: 10_000,
+    });
+    // Trigger was breakeven (0%) but the fill was -95%: unmistakable gap.
+    assert.ok(Math.abs(record.exitTriggerPct - 0) < 1e-9);
+    assert.ok(Math.abs(record.exitPct - -95) < 1e-9);
+    assert.equal(record.gapThroughStop, true);
+  });
+
+  test("clean stop fill does not flag a gap", () => {
+    const position = openPosition({
+      id: "solana:CLEAN",
+      chain: "solana",
+      pairAddress: "PAIR",
+      tokenAddress: "TOKEN",
+      symbol: "CLEAN",
+      tokenName: "Clean",
+      quoteSymbol: "SOL",
+      dexId: "raydium",
+      marketPrice: 1,
+      usdSize: 100,
+      now: 0, // opened long ago: update below lands past the early window
+    });
+    updatePosition(position, 0.849, 200_000); // just through the -15% stop
+    assert.equal(position.closedReason, "STOP_EXIT");
+
+    const record = tradeRecordFromPosition(position, {
+      pnlUsd: totalPnlUsd(position),
+      pnlPct: totalPnlPct(position),
+      balanceBeforeUsd: 10_000,
+      balanceAfterUsd: 10_000,
+    });
+    assert.ok(Math.abs(record.exitTriggerPct - -15) < 1e-9);
+    assert.equal(record.gapThroughStop, false);
   });
 });

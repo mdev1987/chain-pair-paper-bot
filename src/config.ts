@@ -32,6 +32,32 @@ function csvLower(name: string, fallback: string): string[] {
   return csv(name, fallback).map((value) => value.toLowerCase());
 }
 
+/**
+ * Parse per-chain position-size overrides ("solana:5,bsc:5" → map).
+ * Exported pure for unit tests. Chains are matched case-insensitively;
+ * empty input means uniform sizing. Throws on malformed entries so a typo
+ * can never silently trade the wrong size.
+ */
+export function parseChainSizes(
+  raw: string | undefined,
+  maxSizeUsd: number,
+): Map<string, number> {
+  const map = new Map<string, number>();
+  if (raw === undefined || raw.trim() === "") return map;
+  for (const part of raw.split(",")) {
+    const [chainRaw, sizeRaw] = part.split(":").map((s) => s.trim());
+    const sizeUsd = Number(sizeRaw);
+    if (!chainRaw || sizeRaw === undefined || sizeRaw === "" || !Number.isFinite(sizeUsd)) {
+      throw new Error(`Invalid CHAIN_POSITION_SIZES entry: "${part}" (want "chain:size")`);
+    }
+    if (sizeUsd <= 0 || sizeUsd > maxSizeUsd) {
+      throw new Error(`CHAIN_POSITION_SIZES entry "${part}": size must be within (0, ${maxSizeUsd}]`);
+    }
+    map.set(chainRaw.toLowerCase(), sizeUsd);
+  }
+  return map;
+}
+
 export const config = {
   mode: env("MODE", "paper"),
 
@@ -41,8 +67,14 @@ export const config = {
     intervalMs: num("DISCOVERY_INTERVAL_MS", 40_000),
     limit: num("DISCOVERY_LIMIT", 20),
     maxRpm: num("DEXPAPRIKA_MAX_RPM", 14),
+    // Evidence-backed new-pool band: younger than 60s usually hasn't
+    // finished early price discovery (wait for it); older than 120s missed
+    // the momentum window (reject). Liquidity $15k–$100k is the region with
+    // the strongest realized expectancy; above $100k behaves differently.
+    minAgeSec: num("NEW_POOL_MIN_AGE_SEC", 60),
     maxAgeSec: num("NEW_POOL_MAX_AGE_SEC", 120),
-    minLiquidityUsd: num("MIN_LIQUIDITY_USD", 10_000),
+    minLiquidityUsd: num("MIN_LIQUIDITY_USD", 15_000),
+    maxLiquidityUsd: num("MAX_LIQUIDITY_USD", 100_000),
     minVolume24hUsd: num("MIN_VOLUME_24H_USD", 1_000),
     minTxns24h: num("MIN_TXNS_24H", 5),
     chains: csvLower(
@@ -65,8 +97,7 @@ export const config = {
 
   entry: {
     auto: bool("AUTO_ENTRY", false),
-    positionSizeUsd: num("POSITION_SIZE_USD", 10),
-    maxOpenPositions: num("MAX_OPEN_POSITIONS", 5),
+    positionSizeUsd: num("POSITION_SIZE_USD", 10),    maxOpenPositions: num("MAX_OPEN_POSITIONS", 5),
     maxPositionAgeMin: num("MAX_POSITION_AGE_MIN", 60),
     // Pre-entry exitability guard: estimated immediate-sell impact of one
     // position against half the venue liquidity (assumed ~50/50 pool).
@@ -80,6 +111,18 @@ export const config = {
     // Never open the same chain:pair twice — closed-trade history
     // (restored from state.json) guards re-entry after restarts.
     oneEntryPerPool: bool("ONE_ENTRY_PER_POOL", true),
+    // Per-chain size overrides ("solana:5,bsc:5"), for chain-specific risk
+    // experiments. Empty = uniform POSITION_SIZE_USD everywhere (frozen
+    // baseline). Chains not listed keep the default size.
+    chainSizes: new Map<string, number>(),
+    // Two-snapshot confirmation: re-quote a qualifying candidate after a
+    // short delay and require price/liquidity to be stable-ish before
+    // entering. Purpose is narrow — avoid entering something that has
+    // already begun failing — not momentum chasing (up moves pass freely).
+    confirmEnabled: bool("ENTRY_CONFIRM_ENABLED", true),
+    confirmDelayMs: num("ENTRY_CONFIRM_DELAY_MS", 3_000),
+    confirmMaxPriceDropPct: num("ENTRY_CONFIRM_MAX_PRICE_DROP_PCT", 5),
+    confirmMaxLiqDropPct: num("ENTRY_CONFIRM_MAX_LIQ_DROP_PCT", 30),
   },
 
   portfolio: {
@@ -99,6 +142,13 @@ export const config = {
     // never stop the trading loops.
     enabled: bool("ANALYTICS_ENABLED", true),
     duckdbPath: env("DUCKDB_PATH", "data/paper.duckdb"),
+  },
+
+  snapshots: {
+    // Per-minute market snapshots of each open position (price, liquidity,
+    // txn mix) into position_snapshots. Exists for one purpose: studying
+    // pre-collapse deterioration (late gappers). Not an exit signal.
+    intervalS: num("SNAPSHOT_INTERVAL_S", 60),
   },
 
   dynamic: {
@@ -226,3 +276,35 @@ if (config.earlyStop.windowSec <= 0) {
 if (config.entry.maxImpactPct <= 0) {
   throw new Error("MAX_ENTRY_IMPACT_PCT must be positive");
 }
+
+if (config.entry.confirmDelayMs <= 0) {
+  throw new Error("ENTRY_CONFIRM_DELAY_MS must be positive");
+}
+
+if (config.entry.confirmMaxPriceDropPct <= 0 || config.entry.confirmMaxLiqDropPct <= 0) {
+  throw new Error("ENTRY_CONFIRM_MAX_*_DROP_PCT must be positive");
+}
+
+if (
+  config.dexPaprika.minAgeSec < 0 ||
+  config.dexPaprika.minAgeSec >= config.dexPaprika.maxAgeSec
+) {
+  throw new Error("NEW_POOL_MIN_AGE_SEC must be non-negative and below NEW_POOL_MAX_AGE_SEC");
+}
+
+if (
+  config.dexPaprika.minLiquidityUsd <= 0 ||
+  config.dexPaprika.minLiquidityUsd >= config.dexPaprika.maxLiquidityUsd
+) {
+  throw new Error("MIN_LIQUIDITY_USD must be positive and below MAX_LIQUIDITY_USD");
+}
+
+if (config.snapshots.intervalS <= 0) {
+  throw new Error("SNAPSHOT_INTERVAL_S must be positive");
+}
+
+// Parsed last: bounds depend on the already-validated balance above.
+config.entry.chainSizes = parseChainSizes(
+  process.env.CHAIN_POSITION_SIZES ?? "",
+  config.portfolio.initialBalanceUsd,
+);

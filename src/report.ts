@@ -1,6 +1,6 @@
 import type { Position } from "./types.ts";
 import type { ChainStat, PortfolioSnapshot } from "./portfolio.ts";
-import { remainingPct, totalPnlPct, totalPnlUsd } from "./position.ts";
+import { remainingPct, SHADOW_COST_MODEL, totalPnlPct, totalPnlUsd } from "./position.ts";
 
 const CHAIN_ICONS: Record<string, string> = {
   solana: "◎",
@@ -178,6 +178,7 @@ export function buildCloseMessage(r: CloseReport): string {
     `💧 Liquidity: entry ${fmtOptUsd(p.entryLiquidityUsd)} → exit ${fmtOptUsd(p.exitLiquidityUsd)}  |  ⏱️ Age at entry: ${p.entryAgeSec !== undefined ? `${Math.round(p.entryAgeSec)}s` : "—"}`,
     `🔝 High: ${fmtPrice(p.highestPrice)}  |  🎯 TP: ${tpMarks}`,
     `📈 PnL: ${fmtSignedUsd(pnlUsd)} (${fmtPct(pnlPct)})`,
+    `🧾 Net model (${SHADOW_COST_MODEL}): ${fmtSignedUsd(pnlUsd - p.shadowFeeUsd - p.shadowSlipUsd)}`,
     `💸 Fees: ${fmtUsd(p.totalEntryFeeUsd + p.totalExitFeeUsd)}  |  🌊 Slippage: ${fmtUsd(p.totalSlippageUsd)}`,
     `💰 Balance: ${fmtUsd(before)} → ${fmtUsd(after)} (Δ ${fmtSignedUsd(delta)})`,
     `📦 Size: ${fmtUsd(p.initialUsdSize)}  |  ⏳ Duration: ${fmtDuration(holdMs)} (${fmtTime(p.openedAt)} → ${fmtTime(p.closedAt ?? Date.now())})`,

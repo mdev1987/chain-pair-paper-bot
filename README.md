@@ -26,7 +26,7 @@ paper portfolio ($10k / $10) → Telegram + DuckDB trade ledger
 
 DEXPaprika is used only for discovering new pools. The bot calls the official `dexpaprika-sdk` and uses `client.pools.listByNetwork(chain, { limit, sort: "desc", orderBy: "created_at" })`. The SDK client has caching disabled for this watcher so a new-pool search is not served from the SDK's normal multi-minute cache.
 
-The bot filters by pool age, liquidity, 24h volume, and 24h transaction count. New pools are sorted newest-first; the age check is applied locally so the SDK stays on its documented network-scoped pool-search path.
+The bot filters by pool age, liquidity, 24h volume, and 24h transaction count. New pools are sorted newest-first; the age check is applied locally so the SDK stays on its documented network-scoped pool-search path. The evidence-backed band is pool age 60–120s (younger hasn't finished price discovery — those are retried later, not rejected) and liquidity $15k–$100k (the region with the strongest realized expectancy; above $100k behaves as a different regime).
 
 ### DexPaprika vs CoinGecko for discovery
 
@@ -42,6 +42,8 @@ Verdict: **DexPaprika stays; do not replace it with the CoinGecko TypeScript SDK
 DexScreener is used only for market data and position pricing. A DEXPaprika pool ID is sent to DexScreener's `/latest/dex/pairs/{chainId}/{pairId}` endpoint. Active positions are grouped by chain and fetched in batches.
 
 Discovery resolution is batched the same way: each chain's unseen pools are resolved with a single `getPairsByChain(chain, poolAddresses)` call per discovery cycle (internally chunked by `DEXSCREENER_PAIR_BATCH_SIZE`), so discovery costs ~1–2 requests per chain per cycle instead of one request per pool. Pools with no DexScreener match yet are simply retried next cycle.
+
+A qualifying candidate is re-quoted once after `ENTRY_CONFIRM_DELAY_MS` before entry (`assessConfirmation` in `src/dexscreener.ts`, pure and unit-tested). Only deterioration rejects — a material price slide or liquidity collapse means the pool has already begun failing. Rising or flat re-quotes always pass; this is not a momentum gate, just a refusal to enter something visibly dying.
 
 The client uses a sliding-window limiter below the 300 requests/minute API limit. Only active paper positions consume the high-frequency price budget.
 
@@ -71,7 +73,7 @@ INITIAL_BALANCE_USD=10000
 POSITION_SIZE_USD=10
 ```
 
-Cash starts at the initial balance. Entry reserves the position size; partial-TP and exit proceeds flow back to cash. Equity = cash + open-position market value. Each position stores balance-before at entry and balance-after at close; closes also record per-trade PnL plus portfolio, per-chain, and per-token stats for chain/token selection analysis.
+Cash starts at the initial balance. Entry reserves the position size; partial-TP and exit proceeds flow back to cash. Equity = cash + open-position market value. Each position stores balance-before at entry and balance-after at close; closes also record per-trade PnL plus portfolio, per-chain, and per-token stats for chain/token selection analysis. `CHAIN_POSITION_SIZES="solana:5"` overrides the size per chain (empty = uniform everywhere). Baseline weights Solana $5 — it produces the most opportunities but all of the catastrophic gaps — while keeping $10 elsewhere; Base is off the chain list (insufficient sample).
 
 A pair is only ever entered once (`ONE_ENTRY_PER_POOL=true`): closed-trade history, restored from `STATE_FILE`, guards re-entry after restarts.
 
@@ -93,19 +95,28 @@ ANALYTICS_ENABLED=true
 DUCKDB_PATH=data/paper.duckdb
 ```
 
-Every entry fill, TP partial, and final exit is appended to `fills`, and every closed position gets one summary row in `trades` (`src/analytics.ts`, `@duckdb/node-api`). Each trade row stores gross `pnl_usd` plus a shadow `net_pnl_usd` under cost model `NET_PNL_100BPS_1PCT` (100 bps fee + 1% slippage per side, research only — never applied to simulated cash) and the full path (`mfe_pct`, `mae_pct`, `exit_pct`, `giveback_pp`, `time_to_mfe_s`, `time_to_mae_s`) for holding-time/trailing research. Older ledgers gain the new columns automatically on open (`ADD COLUMN IF NOT EXISTS`). Contract addresses, pair, and pool IDs are stored **in full — no ellipsis truncation** (same for Telegram BUY/CLOSE messages). The ledger is best-effort: init/write failures are logged and trading continues; SIGTERM/SIGINT flushes a `CHECKPOINT` before exit.
+Every entry fill, TP partial, and final exit is appended to `fills`, and every closed position gets one summary row in `trades` (`src/analytics.ts`, `@duckdb/node-api`). Each trade row stores gross `pnl_usd` plus a shadow `net_pnl_usd` under cost model `NET_PNL_100BPS_1PCT` (100 bps fee + 1% slippage per side, research only — never applied to simulated cash, with the modeled components split out as `modeled_fee_usd` / `modeled_slip_usd`) and the full path (`mfe_pct`, `mae_pct`, `exit_pct`, `giveback_pp`, `time_to_mfe_s`, `time_to_mae_s`, `exit_trigger_pct`, `gap_through_stop`). The trigger/fill split separates *where the stop was* from *where the fill printed*: a fill materially worse than the trigger (beyond 1pp tolerance) flags a gap-through-stop, which makes stop-failure analysis a direct query. Open positions also emit a per-minute market snapshot (price, liquidity, txn mix) into `position_snapshots` — research input for studying pre-collapse deterioration in late gappers, never an exit signal. Older ledgers gain new columns automatically on open (`ADD COLUMN IF NOT EXISTS`). Contract addresses, pair, and pool IDs are stored **in full — no ellipsis truncation** (same for Telegram BUY/CLOSE messages). The ledger is best-effort: init/write failures are logged and trading continues; SIGTERM/SIGINT flushes a `CHECKPOINT` before exit.
 
 Example analysis (any script with access to `src/analytics.ts`):
 
 ```ts
 import { analyticsQuery } from "./src/analytics.ts";
 
-// Win rate + PnL per chain
+// Win rate + gross vs modeled net per chain (net is the comparison metric)
 console.log(await analyticsQuery(`
   SELECT chain, count(*) AS trades,
          count(*) FILTER (WHERE pnl_usd > 0) AS wins,
-         round(sum(pnl_usd), 2) AS pnl_usd
-  FROM trades GROUP BY chain ORDER BY pnl_usd DESC`));
+         round(sum(pnl_usd), 2) AS gross_usd,
+         round(sum(modeled_fee_usd + modeled_slip_usd), 2) AS modeled_cost_usd,
+         round(sum(net_pnl_usd), 2) AS net_usd
+   FROM trades GROUP BY chain ORDER BY net_usd DESC`));
+
+// Gap-through-stop audit: how often stops held vs gapped, and what gaps cost
+console.log(await analyticsQuery(`
+  SELECT reason, count(*) AS trades,
+         count(*) FILTER (WHERE gap_through_stop) AS gaps,
+         round(sum(pnl_usd) FILTER (WHERE gap_through_stop), 2) AS gap_pnl_usd
+   FROM trades GROUP BY reason ORDER BY gaps DESC`));
 
 // Best tokens by realized PnL
 console.log(await analyticsQuery(`
@@ -167,7 +178,7 @@ import { convert } from "telegram-markdown-v2";
 Messages are authored in ordinary Markdown and converted before being sent with Telegram `parse_mode=MarkdownV2`. Report builders live in `src/report.ts` (pure functions, unit-tested in `tests/report.test.ts`); cash/equity accounting lives in `src/portfolio.ts`.
 
 - 🟢 BUY: token, chain + icon, DEX, full pair + pool IDs, full token CA, quote, entry, size, entry liquidity + pool age at entry, SL/TP/trail config, balance-before → cash-after, open slots.
-- Close (📉 trailing / 🔴 stop / 🛑 early / 🛟 breakeven / ⏱ time): full pair + pool IDs, full token CA, entry → exit, high, TP hits, PnL $ + %, fees/slippage, entry → exit liquidity, age at entry, balance before → after, duration + timestamps, portfolio totals (trades, win rate, total PnL, equity), per-chain and per-token lines for analysis, DexScreener link.
+- Close (📉 trailing / 🔴 stop / 🛑 early / 🛟 breakeven / ⏱ time): full pair + pool IDs, full token CA, entry → exit, high, TP hits, PnL $ + % plus the shadow net-model line, fees/slippage, entry → exit liquidity, age at entry, balance before → after, duration + timestamps, portfolio totals (trades, win rate, total PnL, equity), per-chain and per-token lines for analysis, DexScreener link.
 
 Verbosity is intentionally minimal: only BUY + CLOSE are sent (`TELEGRAM_ANNOUNCE_CANDIDATES=false`, `TELEGRAM_TRADE_UPDATES=false`). Candidate "NEW PAIR" pings and interim 💰 TP / 🛟 breakeven / 📈 trailing messages stay in the daemon logs; set the flags to `true` to receive them on Telegram too.
 

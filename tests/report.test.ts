@@ -119,7 +119,7 @@ describe("telegram reporting", () => {
     void pnl;
     for (const needle of [
       "TEST", "solana", "raydium", "PAIRADDR123456789", "TOKENADDR123456789", "Pool:", "POOLADDR123456789", "Entry", "Exit",
-      "PnL", "Balance", "Duration", "Portfolio", "Win", "Liquidity", "Age at entry",
+      "PnL", "Net model", "Balance", "Duration", "Portfolio", "Win", "Liquidity", "Age at entry",
     ]) {
       assert.ok(text.includes(needle), `close message missing ${needle}`);
     }

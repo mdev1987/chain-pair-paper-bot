@@ -76,6 +76,12 @@ export interface Position {
   updatedAt: number;
   closedAt?: number;
   closedReason?: string;
+  /**
+   * Stop level (price) that triggered the exit, captured at close time.
+   * Lets the ledger separate trigger from fill to detect gap-through-stop.
+   * TIME_EXIT sets it to the exit price itself (no stop involved).
+   */
+  exitTriggerPrice?: number;
 
   trailingActive: boolean;
   breakevenArmed: boolean;
