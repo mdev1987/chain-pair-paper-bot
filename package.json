@@ -1,0 +1,22 @@
+{
+  "name": "chain-pair-paper-bot",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "check": "bunx tsc --noEmit",
+    "test": "bun test tests/"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.5-r.5",
+    "dexpaprika-sdk": "1.6.1",
+    "grammy": "1.46.0",
+    "telegram-markdown-v2": "0.0.5"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.3"
+  }
+}

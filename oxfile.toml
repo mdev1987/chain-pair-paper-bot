@@ -1,0 +1,44 @@
+version = 1
+
+# Chain Pair Paper Bot — Node.js/Bun TypeScript paper trading bot (v0.4.0).
+# Pipeline: DexPaprika SDK new-pool discovery -> cheap candidate filters
+#   -> DexScreener pair resolution -> DexScreener price tracking
+#   -> partial TP + breakeven/trailing/hard SL + time exit
+#   -> Telegram BUY/CLOSE + DuckDB ledger; state.json for positions recovery.
+# See README.md for methodology. Keys come from .env (gitignored, never commit).
+# Apply with: oxmgr apply ./oxfile.toml   (from this directory)
+# Logs with:  oxmgr logs chain-pair-paper-bot -f
+
+[[apps]]
+name = "chain-pair-paper-bot"
+# Bun runtime: loads .env automatically and runs TypeScript directly,
+# matching `bun run src/main.ts` in package.json. Absolute bun path so
+# the daemon does not depend on interactive-shell PATH.
+# Verified: `which bun` -> /usr/bin/bun.
+command = "/usr/bin/bun run src/main.ts"
+cwd = "/home/mdev/Programming/chain-pair-paper-bot-node"
+restart_policy = "always"
+max_restarts = 100
+# Stop after 5 crash-restarts inside 5 minutes: a persistent config error
+# (e.g. missing .env keys, exit code != 0) must error-state, not hot-loop.
+# 0 would disable this protection entirely.
+crash_restart_limit = 5
+restart_delay_secs = 10
+stop_signal = "SIGTERM"
+stop_timeout_secs = 20
+# The worker logs every discovery cycle (~40s, DISCOVERY_INTERVAL_MS) to
+# stdout, which oxmgr captures to <name>.log (unified_logs below merges
+# stderr into the same file). A log older than 6 minutes means the loop is
+# stuck or wedged on network I/O -> restart. Missing file = fresh boot, pass.
+health_cmd = "/bin/sh -c 'test ! -f /home/mdev/.local/share/oxmgr/logs/chain-pair-paper-bot.log || test -n \"$(/usr/bin/find /home/mdev/.local/share/oxmgr/logs/chain-pair-paper-bot.log -mmin -6 2>/dev/null)\"'"
+health_interval_secs = 60
+health_timeout_secs = 5
+health_max_failures = 3
+# Deps must resolve before a reload cuts over; a failed sync aborts the
+# reload and the old process keeps running.
+pre_reload_cmd = "/bin/sh -c 'cd /home/mdev/Programming/chain-pair-paper-bot-node && /usr/bin/bun install --frozen-lockfile'"
+unified_logs = true
+
+[apps.env]
+PATH = "/usr/bin:/usr/local/bin:/home/mdev/.local/bin:/home/mdev/.cargo/bin:/bin"
+HOME = "/home/mdev"
