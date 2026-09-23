@@ -26,9 +26,13 @@ const limiter = new SlidingWindowRateLimiter(config.dexPaprika.maxRpm);
 
 const client = new DexPaprikaClient(
   config.dexPaprika.baseUrl,
-  {},
   {
-    ...(config.dexPaprika.apiKey ? { apiKey: config.dexPaprika.apiKey } : {}),
+    // The SDK has no apiKey option — its second constructor arg is raw
+    // axios options, so auth rides as a plain Authorization header
+    // (verified against the API directly; no Bearer prefix).
+    ...(config.dexPaprika.apiKey ? { headers: { Authorization: config.dexPaprika.apiKey } } : {}),
+  },
+  {
     retry: {
       maxRetries: 3,
       delaySequenceMs: [250, 750, 1500],
