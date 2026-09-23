@@ -69,11 +69,27 @@ export function buildInfuraUrl(chain: string, apiKey: string | undefined): strin
 }
 
 /**
+ * dRPC load-balancer chains. URL form carries the key in-path:
+ * https://lb.drpc.live/<chain>/<DRPC_API_KEY>. Explicitly mapped — only
+ * chains confirmed working are listed (robinhood has no other source).
+ */
+const DRPC_CHAINS: Record<string, string> = {
+  bsc: "bsc",
+  robinhood: "robinhood",
+};
+
+/** Pure builder, unit-tested. Null when the chain or key is missing. */
+export function buildDrpcUrl(chain: string, apiKey: string | undefined): string | null {
+  const slug = DRPC_CHAINS[chain];
+  if (!slug || !apiKey) return null;
+  return `https://lb.drpc.live/${slug}/${apiKey}`;
+}
+
+/**
  * Public read-only RPC defaults so simulation (decimals reads, direct-V2
  * quotes, eth_call) works without private endpoints. Low-frequency use
- * only — configure private EVM_RPC_URLS for anything heavier. No entry
- * for chains without a reliable public endpoint (robinhood): those skip
- * simulation with an explicit reason until configured.
+ * only. Chains without any source (no public default, key, or override)
+ * skip simulation with an explicit reason until configured.
  */
 const DEFAULT_PUBLIC_RPCS: Record<string, string> = {
   ethereum: "https://ethereum-rpc.publicnode.com",
@@ -85,11 +101,16 @@ const DEFAULT_PUBLIC_RPCS: Record<string, string> = {
 };
 
 function rpcUrls(): Record<string, string> {
-  // Precedence: explicit EVM_RPC_URLS > Infura key > public defaults.
+  // Precedence: explicit EVM_RPC_URLS > dRPC key > Infura key > public.
   const merged: Record<string, string> = { ...DEFAULT_PUBLIC_RPCS };
   const infuraKey = process.env.INFURA_API_KEY ?? "";
   for (const chain of Object.keys(INFURA_HOSTS)) {
     const url = buildInfuraUrl(chain, infuraKey);
+    if (url) merged[chain] = url;
+  }
+  const drpcKey = process.env.DRPC_API_KEY ?? "";
+  for (const chain of Object.keys(DRPC_CHAINS)) {
+    const url = buildDrpcUrl(chain, drpcKey);
     if (url) merged[chain] = url;
   }
   try {

@@ -6,8 +6,7 @@ import { mapJupiterOrder } from "../src/execution/solana/jupiter.ts";
 import { mapZeroExQuote } from "../src/execution/evm/zeroex.ts";
 import { quoteV2AmountOut, UniswapV2DirectExecutor } from "../src/execution/evm/uniswap.ts";
 import { PaperExecutor } from "../src/execution/paper.ts";
-import { buildInfuraUrl } from "../src/execution/evm/viem-client.ts";
-import {
+import { buildDrpcUrl, buildInfuraUrl } from "../src/execution/evm/viem-client.ts";import {
   decimalsFromDasAsset,
   decimalsFromMintData,
 } from "../src/execution/solana/helius.ts";
@@ -214,5 +213,13 @@ describe("RPC sources", () => {
     assert.equal(decimalsFromMintData(bytes.toString("base64")), 9);
     assert.equal(decimalsFromMintData(Buffer.alloc(10).toString("base64")), null);
     assert.equal(decimalsFromMintData("!!!not-base64!!!"), null);
+  });
+
+  test("buildDrpcUrl maps only confirmed chains", () => {
+    assert.equal(buildDrpcUrl("bsc", "k"), "https://lb.drpc.live/bsc/k");
+    assert.equal(buildDrpcUrl("robinhood", "k"), "https://lb.drpc.live/robinhood/k");
+    assert.equal(buildDrpcUrl("base", "k"), null);
+    assert.equal(buildDrpcUrl("bsc", ""), null);
+    assert.equal(buildDrpcUrl("bsc", undefined), null);
   });
 });
