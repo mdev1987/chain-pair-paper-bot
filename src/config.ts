@@ -164,6 +164,15 @@ for (const level of config.tp) {
   }
 }
 
+// TP levels are evaluated against the same gain figure, so gains must be
+// strictly ascending — otherwise a lower later level would be unreachable
+// on the same tick under ordered evaluation, and fill order would surprise.
+for (let i = 1; i < config.tp.length; i++) {
+  if (config.tp[i]!.gainPct <= config.tp[i - 1]!.gainPct) {
+    throw new Error("TP gain percentages must be strictly ascending (TP1_PCT < TP2_PCT < TP3_PCT)");
+  }
+}
+
 if (config.telegram.enabled && (!config.telegram.token || !config.telegram.chatId)) {
   throw new Error("TELEGRAM_ENABLED=true requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID");
 }

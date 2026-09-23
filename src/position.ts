@@ -159,7 +159,10 @@ export function updatePosition(
   for (let i = 0; i < config.tp.length; i++) {
     const level = config.tp[i]!;
     if (position.tpHit[i]) continue;
-    if (gain < level.gainPct) break;
+    // Order-independent: a level below the current gain must not block
+    // later levels when TP gains are misordered. Startup config validation
+    // requires strictly ascending gains; this loop stays correct regardless.
+    if (gain < level.gainPct) continue;
 
     const { qty: sold, proceedsUsd } = sellQuantity(
       position,

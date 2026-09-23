@@ -355,12 +355,15 @@ async function trackPositions(): Promise<void> {
   for (const [chain, pairAddresses] of grouped) {
     try {
       const pairs = await getPairsByChain(chain, pairAddresses);
-      const pairMap = new Map(pairs.map((pair) => [pair.pairAddress, pair]));
+      // DexScreener may return checksummed/lowercased addresses that differ
+      // in case from what was requested (EVM hex). Match case-insensitively
+      // like discovery does, so a price update is never missed on casing.
+      const pairMap = new Map(pairs.map((pair) => [pair.pairAddress.toLowerCase(), pair]));
 
       for (const position of [...positions.values()].filter((p) => p.chain === chain)) {
         if (position.status !== "OPEN") continue;
 
-        const pair = pairMap.get(position.pairAddress);
+        const pair = pairMap.get(position.pairAddress.toLowerCase());
         if (!pair) continue;
         const price = parsePrice(pair);
         if (price === null) continue;
