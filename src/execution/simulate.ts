@@ -96,6 +96,22 @@ export function directV2SkipReason(pairAddress?: string): string | null {
 }
 
 /**
+ * Skip-note for a missing direct adapter, or null when no explanation is
+ * owed: a direct adapter is present, the chain has no direct quoters at
+ * all (Solana — jupiter-only by design), or no pair was supplied.
+ * Pure — tested.
+ */
+export function directSkipReasonFor(
+  chain: string,
+  pairAddress: string | undefined,
+  adapterNames: string[],
+): string | null {
+  if (adapterNames.includes("uniswap") || adapterNames.includes("uniswap-v4")) return null;
+  if (EVM_CHAIN_IDS[chain] === undefined) return null;
+  return directV2SkipReason(pairAddress);
+}
+
+/**
  * True when a quote-check note reports a drained/uninitialized pool, i.e.
  * the paper fill may overstate an exit that was unfillable on-chain.
  * Includes the truncated form ("…uniswap-v4: Error: V4 n") produced by
@@ -146,9 +162,14 @@ function skipped(note: string): SimCheckResult {
 export async function simulateSwap(input: SimCheckInput): Promise<SimCheckResult> {
   const adapters = quoteAdaptersFor(input.chain, input.pairAddress);
   if (adapters.length === 0) return skipped(`unsupported-chain ${input.chain}`);
-  // Only explain the missing direct adapter when neither V2 nor V4 was added.
-  const hasDirect = adapters.some((a) => a.name === "uniswap" || a.name === "uniswap-v4");
-  const v2Skip = hasDirect ? null : directV2SkipReason(input.pairAddress);
+  // Only explain the missing direct adapter when neither V2 nor V4 was
+  // added on a chain that has direct quoters (EVM). Solana is
+  // jupiter-only by design — no skip note owed.
+  const v2Skip = directSkipReasonFor(
+    input.chain,
+    input.pairAddress,
+    adapters.map((a) => a.name),
+  );
 
   const request: QuoteRequest = {
     chain: input.chain,

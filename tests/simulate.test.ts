@@ -2,6 +2,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import {
   KNOWN_QUOTE_DECIMALS,
+  directSkipReasonFor,
   directV2SkipReason,
   qtyToBaseUnits,
   quoteAdaptersFor,
@@ -71,6 +72,17 @@ describe("simulation helpers", () => {
     assert.equal(quoteNoteIndicatesDrained("no-quotable-route: Error: No quotable route for 0x622 -> 0x000: 0x: ZEROEX_API_KEY is not configured"), false);
     assert.equal(quoteNoteIndicatesDrained("uniswap | eth-call-revert: TRANSFER_FROM_FAILED"), false);
     assert.equal(quoteNoteIndicatesDrained(""), false);
+  });
+
+  test("direct skip note owed only on EVM without a direct adapter", () => {
+    assert.equal(directSkipReasonFor("solana", "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM", ["jupiter"]), null);
+    assert.equal(directSkipReasonFor("robinhood", "0xdb9cc66942610b8d434aff2c8df97a1d42e44dbcbc1b7065d215db1f1bd2f04c", ["0x", "uniswap-v4"]), null);
+    assert.equal(directSkipReasonFor("bsc", "0x0000000000000000000000000000000000000001", ["0x", "uniswap"]), null);
+    assert.equal(
+      directSkipReasonFor("robinhood", "not-an-address", ["0x"]),
+      "uniswap: not-v2-pair (len=14)",
+    );
+    assert.equal(directSkipReasonFor("unknown-chain", "whatever", []), null);
   });
 
   test("simulateSwap skips unsupported chains without network", async () => {
