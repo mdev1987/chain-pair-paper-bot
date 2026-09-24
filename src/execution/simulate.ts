@@ -71,10 +71,24 @@ export function quoteAdaptersFor(chain: string, pairAddress?: string): QuoteAdap
     try {
       adapters.push(new UniswapV2DirectExecutor(pairAddress));
     } catch {
-      // Invalid pair address: aggregator-only routing.
+      // Invalid pair address (e.g. Uniswap V4 pool id = 64 hex, not a V2
+      // pair contract): aggregator-only routing. Diagnosed by callers via
+      // directV2SkipReason so quote_checks notes can explain the omission.
     }
   }
   return adapters;
+}
+
+/**
+ * Why the direct-V2 adapter was omitted for this pairAddress, or null when
+ * it was included / no pair was supplied. Pure — no network. Exists so
+ * quote_checks notes say "uniswap: not-v2-pair (len=66)" instead of a
+ * silent adapter drop that looks like a routing bug.
+ */
+export function directV2SkipReason(pairAddress?: string): string | null {
+  if (!pairAddress) return null;
+  if (/^0x[0-9a-fA-F]{40}$/.test(pairAddress)) return null;
+  return `uniswap: not-v2-pair (len=${pairAddress.length})`;
 }
 
 export interface SimCheckInput {
@@ -118,6 +132,7 @@ function skipped(note: string): SimCheckResult {
 export async function simulateSwap(input: SimCheckInput): Promise<SimCheckResult> {
   const adapters = quoteAdaptersFor(input.chain, input.pairAddress);
   if (adapters.length === 0) return skipped(`unsupported-chain ${input.chain}`);
+  const v2Skip = directV2SkipReason(input.pairAddress);
 
   const request: QuoteRequest = {
     chain: input.chain,
@@ -135,7 +150,8 @@ export async function simulateSwap(input: SimCheckInput): Promise<SimCheckResult
   try {
     quote = await routeQuote(adapters, request, input.side === "BUY" ? "buy" : "sell");
   } catch (error) {
-    return skipped(`no-quotable-route: ${String(error).slice(0, 200)}`);
+    const skip = v2Skip ? `; ${v2Skip}` : "";
+    return skipped(`no-quotable-route: ${String(error).slice(0, 180)}${skip}`);
   }
 
   const risk = assessQuoteRisk(quote, SIM_RISK_POLICY);

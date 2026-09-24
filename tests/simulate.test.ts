@@ -2,6 +2,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import {
   KNOWN_QUOTE_DECIMALS,
+  directV2SkipReason,
   qtyToBaseUnits,
   quoteAdaptersFor,
   quotePriceUsd,
@@ -45,6 +46,18 @@ describe("simulation helpers", () => {
     assert.deepEqual(quoteAdaptersFor("bsc").map((a) => a.name), ["0x"]);
     assert.deepEqual(quoteAdaptersFor("robinhood", "0x0000000000000000000000000000000000000001").map((a) => a.name), ["0x", "uniswap"]);
     assert.deepEqual(quoteAdaptersFor("unknown-chain"), []);
+  });
+
+  test("V4 pool ids (64-hex) drop direct-V2 and leave a skip diagnostic", () => {
+    const v4 = "0xdb9cc66942610b8d434aff2c8df97a1d42e44dbcbc1b7065d215db1f1bd2f04c";
+    assert.deepEqual(quoteAdaptersFor("robinhood", v4).map((a) => a.name), ["0x"]);
+    assert.equal(directV2SkipReason(v4), "uniswap: not-v2-pair (len=66)");
+    assert.equal(
+      directV2SkipReason("0x0000000000000000000000000000000000000001"),
+      null,
+    );
+    assert.equal(directV2SkipReason(undefined), null);
+    assert.equal(directV2SkipReason(""), null);
   });
 
   test("simulateSwap skips unsupported chains without network", async () => {
