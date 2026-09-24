@@ -1181,6 +1181,14 @@ async function runLoop(label: string, intervalMs: number, task: () => Promise<vo
   }
 }
 
+/** One-line exit-regime summary per chain for the boot banner. */
+function describeExitProfile(chain: string): string {
+  const profile = resolveExitProfile(chain);
+  if (!profile) return `${chain}: global`;
+  const ladder = profile.tp.map((t) => `+${t.gainPct}%/${t.sellPct}%`).join("→");
+  return `${chain}: TP ${ladder}, trail ${profile.trailActivationPct}/${profile.trailDistancePct}, ${profile.maxPositionAgeMin}m`;
+}
+
 async function main(): Promise<void> {
   // Single-instance guard first: a second process sharing state.json and
   // paper.duckdb silently corrupts both (cash jumps, ledger lock losses).
@@ -1204,7 +1212,20 @@ async function main(): Promise<void> {
       ? ` (overrides: ${[...config.entry.chainSizes.entries()].map(([c, s]) => `${c}=$${s}`).join(", ")})`
       : ""));
   console.log(`Initial balance     : $${config.portfolio.initialBalanceUsd}`);
-  console.log(`Max positions       : ${config.entry.maxOpenPositions}`);
+  console.log(`Max positions       : ${config.entry.maxOpenPositions}` +
+    (config.risk.chainCaps.size > 0
+      ? ` (chain caps: ${[...config.risk.chainCaps.entries()].map(([c, n]) => `${c}=${n}`).join(", ")})`
+      : " (no per-chain caps)") +
+    `, symbol cluster x${config.risk.maxSameSymbolOpen}`);
+  console.log(`Breaker             : ${config.risk.breakerStops} stops/${config.risk.breakerWindowMin}m → pause ${config.risk.breakerPauseMin}m` +
+    `  |  Expectancy gate: last ${config.risk.expectancyTrades} net<0` +
+    `  |  Paper daily stop: ${config.risk.paperDailyLossLimitUsd > 0 ? `-$${config.risk.paperDailyLossLimitUsd}` : "off"}`);
+  console.log(`Breakeven           : arm +${config.dynamic.breakevenArmPct}% / buffer +${config.dynamic.breakevenBufferPct}%` +
+    (config.dynamic.breakevenAfterTp1 ? " (+TP1 fallback)" : ""));
+  console.log(`Exit profiles       : ${config.dexPaprika.chains.map(describeExitProfile).join("  |  ")}`);
+  console.log(`Safety              : ${config.safety.enabled ? `on${config.safety.strict ? " (strict)" : ""}` : "off"}` +
+    `, repeat-symbol ${config.safety.blockRepeatSymbols ? "blocked" : "allowed"}` +
+    `, quote-deviation ${config.safety.quoteDeviationPct}%`);
   console.log(`Telegram            : ${config.telegram.enabled}`);
   console.log(`CoinGecko key       : ${config.coingecko.apiKey ? "present (enrichment only)" : "absent"}`);
   // Quote-layer visibility: without a 0x key every EVM quote-check runs
