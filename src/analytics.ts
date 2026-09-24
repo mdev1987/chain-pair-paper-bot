@@ -50,7 +50,13 @@ export interface FillRecord {
   feeUsd: number;
   slipUsd: number;
   detail: string;
+  /** Cash after the fill. Always cash — never equity (see equityAfterUsd). */
   balanceAfterUsd: number;
+  /**
+   * Portfolio equity (cash + open positions) after the fill. NULL on
+   * ledgers predating the column; NaN on live-wallet rows (separate money).
+   */
+  equityAfterUsd: number | null;
 }
 
 export interface TradeRecord {
@@ -121,7 +127,8 @@ const FILLS_DDL = `CREATE TABLE IF NOT EXISTS fills (
   time BIGINT, side VARCHAR, position_id VARCHAR, chain VARCHAR, dex VARCHAR,
   symbol VARCHAR, token_name VARCHAR, pair VARCHAR, pool VARCHAR, ca VARCHAR,
   quote VARCHAR, price DOUBLE, qty DOUBLE, notional_usd DOUBLE, fee_usd DOUBLE,
-  slip_usd DOUBLE, detail VARCHAR, balance_after_usd DOUBLE
+  slip_usd DOUBLE, detail VARCHAR, balance_after_usd DOUBLE,
+  equity_after_usd DOUBLE
 )`;
 
 // Per-minute market snapshots of open positions. Exists for one research
@@ -215,6 +222,8 @@ async function openConnection(dbPath: string): Promise<DuckDBConnection> {
     const name = column.split(" ")[0]!;
     await connection.run(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS ${name} ${column.slice(name.length + 1)}`);
   }
+  // fills.equity_after_usd did not exist before: old rows keep NULL.
+  await connection.run(`ALTER TABLE fills ADD COLUMN IF NOT EXISTS equity_after_usd DOUBLE`);
   // Idempotent backfill: exits whose quote diagnostic reported a drained
   // pool predate the drained_exit column.
   try {
@@ -283,13 +292,18 @@ export async function recordFill(fill: FillRecord): Promise<void> {
   const c = await ensure();
   if (!c) return;
   try {
+    // Explicit column list: migrated ledgers append equity_after_usd at
+    // the end, so positional INSERTs would misalign there.
     await c.run(
-      `INSERT INTO fills VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+      `INSERT INTO fills (time, side, position_id, chain, dex, symbol,
+        token_name, pair, pool, ca, quote, price, qty, notional_usd,
+        fee_usd, slip_usd, detail, balance_after_usd, equity_after_usd)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
       [
         fill.time, fill.side, fill.positionId, fill.chain, fill.dex,
         fill.symbol, fill.tokenName, fill.pair, fill.pool, fill.ca,
         fill.quote, fill.price, fill.qty, fill.notionalUsd, fill.feeUsd,
-        fill.slipUsd, fill.detail, fill.balanceAfterUsd,
+        fill.slipUsd, fill.detail, fill.balanceAfterUsd, fill.equityAfterUsd,
       ],
     );
   } catch (error) {

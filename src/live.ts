@@ -204,6 +204,7 @@ function liveFillRow(
     slipUsd: 0,
     detail,
     balanceAfterUsd: NaN, // Live wallet is separate from paper cash.
+    equityAfterUsd: NaN, // Paper equity is meaningless for live fills.
   };
 }
 

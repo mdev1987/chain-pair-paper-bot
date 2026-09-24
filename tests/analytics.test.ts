@@ -32,7 +32,7 @@ describe("duckdb trade ledger", () => {
       time: 1, side: "BUY", positionId: "x", chain: "solana", dex: "raydium",
       symbol: "T", tokenName: "T", pair: "P", pool: "", ca: "C", quote: "SOL",
       price: 1, qty: 1, notionalUsd: 1, feeUsd: 0, slipUsd: 0,
-      detail: "OPEN", balanceAfterUsd: 1,
+      detail: "OPEN", balanceAfterUsd: 1, equityAfterUsd: 1,
     });
     assert.equal(existsSync(offPath), false, "disabled ledger must not create a file");
 
@@ -45,7 +45,7 @@ describe("duckdb trade ledger", () => {
       pair: "PAIRADDR123456789", pool: "POOLADDR123456789",
       ca: "TOKENADDR123456789", quote: "SOL", price: 1, qty: 10,
       notionalUsd: 10, feeUsd: 0, slipUsd: 0, detail: "OPEN",
-      balanceAfterUsd: 9_990,
+      balanceAfterUsd: 9_990, equityAfterUsd: 10_000,
     });
     await recordFill({
       time: 2_000, side: "SELL", positionId: "solana:PAIR", chain: "solana",
@@ -53,7 +53,7 @@ describe("duckdb trade ledger", () => {
       pair: "PAIRADDR123456789", pool: "POOLADDR123456789",
       ca: "TOKENADDR123456789", quote: "SOL", price: 1.3, qty: 2.5,
       notionalUsd: 3.25, feeUsd: 0, slipUsd: 0, detail: "TP1",
-      balanceAfterUsd: 9_993.25,
+      balanceAfterUsd: 9_993.25, equityAfterUsd: 9_996,
     });
     await recordTrade({
       positionId: "solana:PAIR", chain: "solana", dex: "raydium",
@@ -71,12 +71,17 @@ describe("duckdb trade ledger", () => {
     });
 
     const fills = await analyticsQuery<Record<string, unknown>>(
-      "SELECT side, detail, qty, notional_usd, pair, pool, ca FROM fills ORDER BY time",
+      "SELECT side, detail, qty, notional_usd, pair, pool, ca, balance_after_usd, equity_after_usd FROM fills ORDER BY time",
     );
     assert.equal(fills.length, 2);
     assert.equal(fills[0]!.side, "BUY");
     assert.equal(fills[0]!.detail, "OPEN");
     assert.equal(fills[1]!.detail, "TP1");
+    // Cash and equity ride side by side (equal here only by fixture choice).
+    assert.equal(fills[0]!.balance_after_usd, 9_990);
+    assert.equal(fills[0]!.equity_after_usd, 10_000);
+    assert.equal(fills[1]!.balance_after_usd, 9_993.25);
+    assert.equal(fills[1]!.equity_after_usd, 9_996);
     // Full addresses — no ellipsis truncation in the ledger.
     assert.equal(fills[0]!.pair, "PAIRADDR123456789");
     assert.equal(fills[0]!.pool, "POOLADDR123456789");

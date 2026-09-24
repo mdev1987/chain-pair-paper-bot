@@ -165,6 +165,7 @@ async function runBuyLeg(
     pair: `${SOL_MINT}/${USDC_MINT}`, pool: "", ca: USDC_MINT, quote: "USDC",
     price: TEST_SIZE_USD / qtyUsdc, qty: qtyUsdc, notionalUsd: TEST_SIZE_USD,
     feeUsd: 0, slipUsd: 0, detail: "LIVE_TEST_BUY", balanceAfterUsd: NaN,
+    equityAfterUsd: NaN,
   });
   await deps.notify(buildLiveFillConfirmedMessage({
     symbol: "TEST/SOL→USDC", chain: "solana", kind: "ENTRY",
@@ -217,7 +218,7 @@ async function runSellLeg(
     pair: `${USDC_MINT}/${SOL_MINT}`, pool: "", ca: USDC_MINT, quote: "SOL",
     price: backSol <= 0 ? 0 : TEST_SIZE_USD / backSol, qty: backSol,
     notionalUsd: TEST_SIZE_USD, feeUsd: 0, slipUsd: 0,
-    detail: "LIVE_TEST_SELL", balanceAfterUsd: NaN,
+    detail: "LIVE_TEST_SELL", balanceAfterUsd: NaN, equityAfterUsd: NaN,
   });
   await deps.notify(buildLiveFillConfirmedMessage({
     symbol: "TEST/USDC→SOL", chain: "solana", kind: "EXIT",

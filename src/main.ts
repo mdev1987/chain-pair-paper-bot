@@ -510,6 +510,7 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
     slipUsd: position.totalSlippageUsd,
     detail: "OPEN",
     balanceAfterUsd: portfolio.cashUsd,
+    equityAfterUsd: portfolio.equityUsd(positions.values()),
   });
   // Parallel real-quote diagnostic (simulation only — paper already booked).
   await recordEntryQuoteCheck(position, activePair, entryPrice, sizeUsd);
@@ -638,6 +639,7 @@ async function trackPositions(): Promise<void> {
                 slipUsd: slipDelta,
                 detail: `TP${event.level}`,
                 balanceAfterUsd: portfolio.cashUsd,
+                equityAfterUsd: portfolio.equityUsd(positions.values()),
               });
               // Parallel real-quote diagnostic for the partial exit fill,
               // same as full exits below. Best-effort: never gates trading.
@@ -710,7 +712,8 @@ async function trackPositions(): Promise<void> {
                 feeUsd: position.totalExitFeeUsd - prev.fee,
                 slipUsd: position.totalSlippageUsd - prev.slip,
                 detail: event.type,
-                balanceAfterUsd: position.balanceAfterUsd,
+                balanceAfterUsd: portfolio.cashUsd,
+                equityAfterUsd: position.balanceAfterUsd,
               });
               await recordTrade(tradeRecordFromPosition(position, {
                 pnlUsd: totalPnlUsd(position),
