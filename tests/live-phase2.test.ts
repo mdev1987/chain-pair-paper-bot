@@ -18,8 +18,10 @@ import {
   applyLiveFill,
   closeLivePosition,
   countOpenLive,
+  liveTpQty,
   loadLivePositions,
   openLivePosition,
+  realizedShare,
   saveLivePositions,
 } from "../src/execution/live-positions.ts";
 import { liveState, persistLiveState, restoreLiveState } from "../src/execution/live-state.ts";
@@ -131,10 +133,11 @@ describe("live position mirror", () => {
   test("TP partials decrement from confirmed fills, oversell refused", () => {
     let positions = openLivePosition([], {
       positionId: "solana:X", chain: "solana", tokenMint: MINT_A, filledBaseUnits: "1000",
+      entryCostUsd: 5,
     });
     assert.equal(countOpenLive(positions), 1);
     assert.throws(
-      () => openLivePosition(positions, { positionId: "solana:X", chain: "solana", tokenMint: MINT_A, filledBaseUnits: "5" }),
+      () => openLivePosition(positions, { positionId: "solana:X", chain: "solana", tokenMint: MINT_A, filledBaseUnits: "5", entryCostUsd: 5 }),
       /already open/,
     );
     positions = applyLiveFill(positions, "solana:X", "250"); // TP1
@@ -154,11 +157,25 @@ describe("live position mirror", () => {
     const path = join(dir, "positions.json");
     const positions = openLivePosition([], {
       positionId: "solana:X", chain: "solana", tokenMint: MINT_A, filledBaseUnits: "1000",
+      entryCostUsd: 5,
     });
     saveLivePositions(positions, path);
     assert.equal(loadLivePositions(path)[0]!.remainingBaseUnits, "1000");
     writeFileSync(path, JSON.stringify([{ positionId: "bad", remainingBaseUnits: "-5" }]), "utf8");
     assert.deepEqual(loadLivePositions(path), []);
+  });
+
+  test("TP quantities derive from the live original, realized shares pro-rate cost", () => {
+    assert.equal(liveTpQty("1000", 25), 250n);
+    assert.equal(liveTpQty("1000", 100), 1000n);
+    assert.throws(() => liveTpQty("1000", 0), /Invalid sellPct/);
+    assert.throws(() => liveTpQty("1000", 101), /Invalid sellPct/);
+    assert.throws(() => liveTpQty("0", 25), /positive/);
+    assert.throws(() => liveTpQty("abc", 25), /Invalid original/);
+    // $10 cost, sell 1/4 for $4 proceeds → 4 - 2.5 = +1.5.
+    assert.equal(realizedShare(4, 10, 250n, 1000n), 1.5);
+    assert.throws(() => realizedShare(4, 10, 250n, 0n), /positive/);
+    assert.throws(() => realizedShare(NaN, 10, 250n, 1000n), /Non-finite/);
   });
 });
 
@@ -222,6 +239,7 @@ describe("startup reconciliation", () => {
     };
     const positions = openLivePosition([], {
       positionId: "p9", chain: "solana", tokenMint: MINT_A, filledBaseUnits: "1000",
+      entryCostUsd: 5,
     });
     const report = await reconcileLiveState(all, positions, deps);
     assert.equal(report.confirmed.length, 1);

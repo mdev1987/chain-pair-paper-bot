@@ -21,6 +21,14 @@ export interface LivePosition {
   tokenMint: string;
   remainingBaseUnits: string;
   filledBaseUnits: string;
+  /**
+   * Entry fill size (base units) — the base for TP fractions. TP sell
+   * quantities derive from THIS, never from paper percentages applied to
+   * paper quantities (entry drag makes them differ).
+   */
+  originalBaseUnits: string;
+  /** USD spent on entry (for realized-PnL cost shares). */
+  entryCostUsd: number;
   status: "OPEN" | "CLOSED";
   openedAt: number;
   updatedAt: number;
@@ -37,6 +45,7 @@ function isLivePosition(value: unknown): value is LivePosition {
       return false;
     }
   };
+  const isCost = typeof p.entryCostUsd === "number" && Number.isFinite(p.entryCostUsd) && p.entryCostUsd > 0;
   return (
     typeof p.positionId === "string" &&
     p.positionId.length > 0 &&
@@ -44,6 +53,8 @@ function isLivePosition(value: unknown): value is LivePosition {
     typeof p.tokenMint === "string" &&
     isBigStr(p.remainingBaseUnits) &&
     isBigStr(p.filledBaseUnits) &&
+    isBigStr(p.originalBaseUnits) &&
+    isCost &&
     (p.status === "OPEN" || p.status === "CLOSED") &&
     typeof p.openedAt === "number" &&
     typeof p.updatedAt === "number"
@@ -78,7 +89,7 @@ export function saveLivePositions(
 
 export function openLivePosition(
   positions: LivePosition[],
-  input: { positionId: string; chain: string; tokenMint: string; filledBaseUnits: string },
+  input: { positionId: string; chain: string; tokenMint: string; filledBaseUnits: string; entryCostUsd: number },
 ): LivePosition[] {
   if (positions.some((p) => p.positionId === input.positionId && p.status === "OPEN")) {
     throw new Error(`Live position already open: ${input.positionId}`);
@@ -90,6 +101,9 @@ export function openLivePosition(
     throw new Error(`Invalid fill amount: ${input.filledBaseUnits}`);
   }
   if (filled <= 0n) throw new Error("Entry fill must be positive");
+  if (!Number.isFinite(input.entryCostUsd) || input.entryCostUsd <= 0) {
+    throw new Error("Entry cost must be positive");
+  }
   const now = Date.now();
   return [
     ...positions.filter((p) => p.positionId !== input.positionId),
@@ -99,6 +113,8 @@ export function openLivePosition(
       tokenMint: input.tokenMint,
       remainingBaseUnits: filled.toString(),
       filledBaseUnits: filled.toString(),
+      originalBaseUnits: filled.toString(),
+      entryCostUsd: input.entryCostUsd,
       status: "OPEN",
       openedAt: now,
       updatedAt: now,
@@ -163,4 +179,40 @@ export function closeLivePosition(
 /** Live open count for the buy gate (wired to live-state in a later step). */
 export function countOpenLive(positions: LivePosition[]): number {
   return positions.filter((p) => p.status === "OPEN").length;
+}
+
+/**
+ * Live TP sell quantity: the strategy fraction applied to the LIVE
+ * original fill — never paper percentages on paper quantities (entry
+ * drag makes them differ). Pure BigInt; throws on degenerate input.
+ */
+export function liveTpQty(originalBaseUnits: string, sellPct: number): bigint {
+  let orig: bigint;
+  try {
+    orig = BigInt(originalBaseUnits);
+  } catch {
+    throw new Error(`Invalid original amount: ${originalBaseUnits}`);
+  }
+  if (orig <= 0n) throw new Error("Original must be positive");
+  if (!(sellPct > 0) || sellPct > 100) throw new Error(`Invalid sellPct: ${sellPct}`);
+  const qty = (orig * BigInt(Math.round(sellPct * 100))) / 10_000n;
+  if (qty <= 0n) throw new Error("TP quantity rounds to zero");
+  return qty;
+}
+
+/**
+ * Realized PnL share for a partial: proceeds minus the proportional
+ * entry-cost share. Approximate (ignores sub-cent network fees).
+ */
+export function realizedShare(
+  proceedsUsd: number,
+  entryCostUsd: number,
+  soldBase: bigint,
+  originalBase: bigint,
+): number {
+  if (originalBase <= 0n) throw new Error("Original must be positive");
+  if (!Number.isFinite(proceedsUsd) || !Number.isFinite(entryCostUsd)) {
+    throw new Error("Non-finite USD input");
+  }
+  return proceedsUsd - (entryCostUsd * Number(soldBase)) / Number(originalBase);
 }

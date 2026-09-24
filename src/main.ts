@@ -48,6 +48,7 @@ import {
   simulateSwap,
 } from "./execution/simulate.ts";
 import { EVM_CHAIN_IDS } from "./execution/evm/viem-client.ts";
+import { initLive, maybeLiveEnter, maybeLiveExit, maybeLiveTp } from "./live.ts";
 
 const seenPools = new Map<string, number>();
 const candidates = new Map<string, Candidate>();
@@ -498,6 +499,8 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
   // Parallel real-quote diagnostic (simulation only — paper already booked).
   await recordEntryQuoteCheck(position, activePair, entryPrice, sizeUsd);
   await announceBuy(position);
+  // Live mirror (no-op unless live Solana entries are enabled).
+  await maybeLiveEnter({ notify, log }, position, activePair, entryPrice, sizeUsd);
 }
 
 async function discover(): Promise<void> {
@@ -624,6 +627,13 @@ async function trackPositions(): Promise<void> {
               // Parallel real-quote diagnostic for the partial exit fill,
               // same as full exits below. Best-effort: never gates trading.
               await recordExitQuoteCheck(position, pair, event.soldQty, event.price);
+              // Live TP mirror (no-op unless live Solana is enabled).
+              await maybeLiveTp({ notify, log }, position, pair, {
+                level: event.level,
+                sellPct: event.sellPct,
+                price: event.price,
+                proceedsUsd: event.proceedsUsd,
+              });
               if (config.telegram.announceUpdates) {
                 await notify(buildTpMessage({
                   position,
@@ -700,6 +710,11 @@ async function trackPositions(): Promise<void> {
               if (exitCheck && quoteNoteIndicatesDrained(exitCheck.note)) {
                 await markTradeDrained(position.id);
               }
+              // Live exit mirror (no-op unless live Solana is enabled).
+              await maybeLiveExit({ notify, log }, position, pair, event.price, {
+                price: event.price,
+                proceedsUsd: event.proceedsUsd,
+              });
               const snapshot = portfolio.snapshot(positions.values());
               const chainStat = portfolio.chainStat(position.chain);
               const tokenStat = portfolio.tokenPnlUsd(position.chain, position.symbol);
@@ -805,6 +820,11 @@ async function main(): Promise<void> {
   }
 
   restore();
+
+  // Live reconciliation (no-op unless LIVE_TRADING_ENABLED=true): restores
+  // the kill switch, reloads journals, and resolves every open live order
+  // from on-chain status before trading resumes.
+  await initLive({ notify, log }, positions);
 
   if (config.telegram.enabled) {
     await testTelegram();
