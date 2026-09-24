@@ -21,6 +21,15 @@ export interface LiveOrder {
   createdAt: number;
   updatedAt: number;
   note?: string;
+  /**
+   * Optional routing context for chain-specific recovery (EVM receipt
+   * fill parsing needs the token pair). Absent on older/strategy orders.
+   */
+  meta?: {
+    sellToken?: string;
+    buyToken?: string;
+    sellAmountBaseUnits?: string;
+  };
 }
 
 const TRANSITIONS: Record<LiveOrderStatus, LiveOrderStatus[]> = {
@@ -33,6 +42,14 @@ const TRANSITIONS: Record<LiveOrderStatus, LiveOrderStatus[]> = {
 function isLiveOrder(value: unknown): value is LiveOrder {
   if (typeof value !== "object" || value === null) return false;
   const o = value as Record<string, unknown>;
+  const meta = o.meta as Record<string, unknown> | undefined;
+  const metaOk =
+    meta === undefined ||
+    (typeof meta === "object" &&
+      meta !== null &&
+      (meta.sellToken === undefined || typeof meta.sellToken === "string") &&
+      (meta.buyToken === undefined || typeof meta.buyToken === "string") &&
+      (meta.sellAmountBaseUnits === undefined || typeof meta.sellAmountBaseUnits === "string"));
   return (
     typeof o.positionId === "string" &&
     o.positionId.length > 0 &&
@@ -44,7 +61,8 @@ function isLiveOrder(value: unknown): value is LiveOrder {
       o.status === "FAILED") &&
     (o.signature === null || typeof o.signature === "string") &&
     typeof o.createdAt === "number" &&
-    typeof o.updatedAt === "number"
+    typeof o.updatedAt === "number" &&
+    metaOk
   );
 }
 

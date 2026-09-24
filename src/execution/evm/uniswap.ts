@@ -8,6 +8,7 @@ import type {
 } from "../types.ts";
 import { requireLive } from "../types.ts";
 import { getEvmPublicClient } from "./viem-client.ts";
+import { liveBuyWithQuoteFlow, liveSellWithQuoteFlow } from "./live.ts";
 
 /**
  * Uniswap V2-style direct quoter (chain-specific fallback for pools the
@@ -220,14 +221,16 @@ export class UniswapV2DirectExecutor implements SwapExecutor {
     throw new Error("Uniswap direct adapter has no native simulate: run this quote through the viem eth_call simulator");
   }
 
-  async buy(): Promise<ExecutionResult> {
-    requireLive("Uniswap buy");
-    throw new Error("unreachable");
+  async buy(
+    request: Parameters<SwapExecutor["buy"]>[0] & { sizeUsd?: number; positionId?: string },
+  ): Promise<ExecutionResult> {
+    return liveBuyWithQuoteFlow(this, "Uniswap V2", request);
   }
 
-  async sell(): Promise<ExecutionResult> {
-    requireLive("Uniswap sell");
-    throw new Error("unreachable");
+  async sell(
+    request: Parameters<SwapExecutor["sell"]>[0],
+  ): Promise<ExecutionResult> {
+    return liveSellWithQuoteFlow(this, "Uniswap V2", request);
   }
 }
 

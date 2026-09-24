@@ -278,11 +278,14 @@ export class UniswapV4DirectExecutor implements SwapExecutor {
 
   async buy(): Promise<ExecutionResult> {
     requireLive("Uniswap V4 buy");
-    throw new Error("unreachable");
+    // V4-direct quotes carry no calldata (no PoolKey) — execution must go
+    // through 0x, which abstracts the pool key away. Refuse loudly rather
+    // than guessing.
+    throw new Error("Uniswap V4 has no executable calldata: route V4 execution through 0x (ZeroExExecutor)");
   }
 
   async sell(): Promise<ExecutionResult> {
     requireLive("Uniswap V4 sell");
-    throw new Error("unreachable");
+    throw new Error("Uniswap V4 has no executable calldata: route V4 execution through 0x (ZeroExExecutor)");
   }
 }

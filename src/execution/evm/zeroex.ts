@@ -6,6 +6,7 @@ import type {
   SwapExecutor,
 } from "../types.ts";
 import { requireLive } from "../types.ts";
+import { liveBuyWithQuoteFlow, liveSellWithQuoteFlow } from "./live.ts";
 
 // 0x Swap API v2 (allowance-holder). v1 was sunset 2025-04-11 — do not
 // revert to /swap/v1/* URLs. Docs: docs.0x.org, "getQuote (Allowance Holder)".
@@ -133,13 +134,15 @@ export class ZeroExExecutor implements SwapExecutor {
     throw new Error("0x adapter has no native simulate: run this quote through the viem eth_call simulator");
   }
 
-  async buy(): Promise<ExecutionResult> {
-    requireLive("0x buy");
-    throw new Error("unreachable");
+  async buy(
+    request: Parameters<SwapExecutor["buy"]>[0] & { sizeUsd?: number; positionId?: string },
+  ): Promise<ExecutionResult> {
+    return liveBuyWithQuoteFlow(this, "0x", request);
   }
 
-  async sell(): Promise<ExecutionResult> {
-    requireLive("0x sell");
-    throw new Error("unreachable");
+  async sell(
+    request: Parameters<SwapExecutor["sell"]>[0],
+  ): Promise<ExecutionResult> {
+    return liveSellWithQuoteFlow(this, "0x", request);
   }
 }

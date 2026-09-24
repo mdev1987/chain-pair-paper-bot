@@ -126,7 +126,8 @@ function rpcUrls(): Record<string, string> {
   return merged;
 }
 
-function chainDef(chain: string): Chain {
+/** Chain definition for viem clients (exported for explicit account+chain calls). */
+export function chainDef(chain: string): Chain {
   const def = KNOWN_CHAINS[chain];
   if (!def) throw new Error(`Unknown EVM chain "${chain}" (known: ${Object.keys(KNOWN_CHAINS).join(", ")})`);
   return def;
