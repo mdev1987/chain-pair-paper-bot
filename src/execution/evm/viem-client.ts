@@ -100,30 +100,55 @@ const DEFAULT_PUBLIC_RPCS: Record<string, string> = {
   polygon: "https://polygon-rpc.com",
 };
 
-function rpcUrls(): Record<string, string> {
+export type RpcSource = "override" | "drpc" | "infura" | "public" | "none";
+
+function rpcEndpoints(): Record<string, { url: string; source: RpcSource }> {
   // Precedence: explicit EVM_RPC_URLS > dRPC key > Infura key > public.
-  const merged: Record<string, string> = { ...DEFAULT_PUBLIC_RPCS };
+  const merged: Record<string, { url: string; source: RpcSource }> = {};
+  for (const [chain, url] of Object.entries(DEFAULT_PUBLIC_RPCS)) {
+    merged[chain] = { url, source: "public" };
+  }
   const infuraKey = process.env.INFURA_API_KEY ?? "";
   for (const chain of Object.keys(INFURA_HOSTS)) {
     const url = buildInfuraUrl(chain, infuraKey);
-    if (url) merged[chain] = url;
+    if (url) merged[chain] = { url, source: "infura" };
   }
   const drpcKey = process.env.DRPC_API_KEY ?? "";
   for (const chain of Object.keys(DRPC_CHAINS)) {
     const url = buildDrpcUrl(chain, drpcKey);
-    if (url) merged[chain] = url;
+    if (url) merged[chain] = { url, source: "drpc" };
   }
   try {
     const parsed: unknown = JSON.parse(process.env.EVM_RPC_URLS ?? "{}");
     if (typeof parsed === "object" && parsed !== null) {
       for (const [chain, url] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof url === "string" && url) merged[chain] = url;
+        if (typeof url === "string" && url) merged[chain] = { url, source: "override" };
       }
     }
   } catch {
     // Malformed EVM_RPC_URLS falls back to Infura/public defaults above.
   }
   return merged;
+}
+
+function rpcUrls(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [chain, ep] of Object.entries(rpcEndpoints())) out[chain] = ep.url;
+  return out;
+}
+
+/**
+ * Where each known EVM chain's RPC currently resolves. Used by the boot
+ * banner so single-RPC chains (Robinhood = dRPC only) are visible before
+ * live money depends on them.
+ */
+export function evmRpcSources(): Record<string, RpcSource> {
+  const endpoints = rpcEndpoints();
+  const out: Record<string, RpcSource> = {};
+  for (const chain of Object.keys(EVM_CHAIN_IDS)) {
+    out[chain] = endpoints[chain]?.source ?? "none";
+  }
+  return out;
 }
 
 /** Chain definition for viem clients (exported for explicit account+chain calls). */

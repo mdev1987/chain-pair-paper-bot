@@ -1,4 +1,5 @@
 import type { VersionedTransactionResponse } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 import { getSolanaConnection } from "./client.ts";
 import { traderPublicKey } from "./signer.ts";
 
@@ -102,4 +103,30 @@ export async function fetchConfirmedFill(
   });
   if (!tx) throw new Error(`Transaction not found (unlanded or pruned): ${signature}`);
   return parseFillFromTransaction(tx, trader, signature);
+}
+
+/** Trader's SPL balance of a mint, base units. Null when unreadable. */
+export async function traderSplTokenBalance(mint: string): Promise<bigint | null> {
+  try {
+    const connection = getSolanaConnection();
+    const trader = traderPublicKey();
+    const accs = await connection.getParsedTokenAccountsByOwner(new PublicKey(trader), {
+      mint: new PublicKey(mint),
+    });
+    let total = 0n;
+    for (const a of accs.value) {
+      const amt = (a.account.data as unknown as { parsed?: { info?: { tokenAmount?: { amount?: unknown } } } })
+        ?.parsed?.info?.tokenAmount?.amount;
+      if (typeof amt === "string") {
+        try {
+          total += BigInt(amt);
+        } catch {
+          // Skip unparseable rows.
+        }
+      }
+    }
+    return total;
+  } catch {
+    return null;
+  }
 }

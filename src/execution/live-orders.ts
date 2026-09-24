@@ -124,9 +124,17 @@ function transition(
 
 export function recordSignal(
   orders: LiveOrder[],
-  input: { positionId: string; chain: string; side: "BUY" | "SELL" },
+  input: {
+    positionId: string;
+    chain: string;
+    side: "BUY" | "SELL";
+    meta?: LiveOrder["meta"];
+  },
 ): LiveOrder[] {
-  return transition(orders, input.positionId, input.side, "SIGNAL", { chain: input.chain });
+  return transition(orders, input.positionId, input.side, "SIGNAL", {
+    chain: input.chain,
+    ...(input.meta !== undefined ? { meta: input.meta } : {}),
+  });
 }
 
 export function markSubmitted(

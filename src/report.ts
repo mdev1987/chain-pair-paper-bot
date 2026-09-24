@@ -72,6 +72,22 @@ export function fmtTime(ts: number): string {
   return d.toISOString().slice(11, 19);
 }
 
+/** Block explorer transaction URL per chain (live fills link out). */
+export function chainTxUrl(chain: string, signature: string): string {
+  const hosts: Record<string, string> = {
+    solana: "https://solscan.io/tx",
+    ethereum: "https://etherscan.io/tx",
+    base: "https://basescan.org/tx",
+    bsc: "https://bscscan.com/tx",
+    arbitrum: "https://arbiscan.io/tx",
+    polygon: "https://polygonscan.com/tx",
+    avalanche: "https://snowscan.xyz/tx",
+    robinhood: "https://robinhoodchain.blockscout.com/tx",
+  };
+  const base = hosts[chain.toLowerCase()] ?? "https://solscan.io/tx";
+  return `${base}/${signature}`;
+}
+
 export interface BuyReport {
   position: Position;
   stopPrice: number;
@@ -234,7 +250,7 @@ export function buildLiveSubmittedMessage(r: LiveSubmitReport): string {
     `### ${badge} — ${r.symbol}`,
     `${chainIcon(r.chain)} ${r.chain}  |  💲 Size: ${fmtUsd(r.sizeUsd)}`,
     `🔗 Signature: \`${r.signature}\``,
-    `[Solscan](https://solscan.io/tx/${r.signature})`,
+    `[Explorer](${chainTxUrl(r.chain, r.signature)})`,
   ].join("\n");
 }
 
@@ -261,6 +277,6 @@ export function buildLiveFillConfirmedMessage(r: LiveFillReport): string {
     `📦 In: \`${r.sellAmount}\`  →  Out: \`${r.buyAmount}\``,
     ...(r.realizedPnlUsd !== undefined ? [`📈 Realized PnL: ${fmtSignedUsd(r.realizedPnlUsd)}`] : []),
     `🔗 Signature: \`${r.signature}\``,
-    `[Solscan](https://solscan.io/tx/${r.signature})`,
+    `[Explorer](${chainTxUrl(r.chain, r.signature)})`,
   ].join("\n");
 }

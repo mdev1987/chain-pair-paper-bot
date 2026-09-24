@@ -352,6 +352,34 @@ describe("RPC sources", () => {
     assert.equal(buildDrpcUrl("bsc", ""), null);
     assert.equal(buildDrpcUrl("bsc", undefined), null);
   });
+
+  test("evmRpcSources reflects precedence and missing chains", async () => {
+    const { evmRpcSources } = await import("../src/execution/evm/viem-client.ts");
+    const savedDrpc = process.env.DRPC_API_KEY;
+    const savedInfura = process.env.INFURA_API_KEY;
+    const savedOverride = process.env.EVM_RPC_URLS;
+    try {
+      process.env.DRPC_API_KEY = "k";
+      delete process.env.INFURA_API_KEY;
+      delete process.env.EVM_RPC_URLS;
+      const bare = evmRpcSources();
+      assert.equal(bare.robinhood, "drpc");
+      assert.equal(bare.bsc, "drpc");
+      assert.equal(bare.ethereum, "public");
+      process.env.EVM_RPC_URLS = JSON.stringify({ robinhood: "https://rh.example/rpc" });
+      assert.equal(evmRpcSources().robinhood, "override");
+      delete process.env.DRPC_API_KEY;
+      assert.equal(evmRpcSources().robinhood, "override");
+      assert.equal(evmRpcSources().bsc, "public");
+    } finally {
+      if (savedDrpc === undefined) delete process.env.DRPC_API_KEY;
+      else process.env.DRPC_API_KEY = savedDrpc;
+      if (savedInfura === undefined) delete process.env.INFURA_API_KEY;
+      else process.env.INFURA_API_KEY = savedInfura;
+      if (savedOverride === undefined) delete process.env.EVM_RPC_URLS;
+      else process.env.EVM_RPC_URLS = savedOverride;
+    }
+  });
 });
 
 describe("uniswap V4 direct quoter", () => {

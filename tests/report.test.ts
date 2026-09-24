@@ -6,6 +6,7 @@ import {
   buildBuyMessage,
   buildCloseMessage,
   buildTpMessage,
+  chainTxUrl,
 } from "../src/report.ts";
 
 function makeClosedPosition() {
@@ -124,5 +125,13 @@ describe("telegram reporting", () => {
       assert.ok(text.includes(needle), `close message missing ${needle}`);
     }
     assert.ok(text.includes("TRAILING"), "close message missing exit-reason label");
+  });
+
+  test("chainTxUrl maps each chain to its explorer", () => {
+    assert.equal(chainTxUrl("solana", "sig"), "https://solscan.io/tx/sig");
+    assert.equal(chainTxUrl("robinhood", "sig"), "https://robinhoodchain.blockscout.com/tx/sig");
+    assert.equal(chainTxUrl("bsc", "sig"), "https://bscscan.com/tx/sig");
+    assert.equal(chainTxUrl("ethereum", "sig"), "https://etherscan.io/tx/sig");
+    assert.equal(chainTxUrl("weirdchain", "sig"), "https://solscan.io/tx/sig");
   });
 });

@@ -1,9 +1,14 @@
-import { PublicKey } from "@solana/web3.js";
 import { config } from "./config.ts";
 import { recordFill, type FillRecord } from "./analytics.ts";
 import { liveTradingEnabled } from "./execution/types.ts";
 import { JupiterExecutor } from "./execution/solana/jupiter.ts";
-import { fetchConfirmedFill } from "./execution/solana/fills.ts";
+import { ZeroExExecutor } from "./execution/evm/zeroex.ts";
+import { EVM_CHAIN_IDS } from "./execution/evm/viem-client.ts";
+import { getEvmTokenDecimals } from "./execution/evm/viem-client.ts";
+import { traderEvmAddress } from "./execution/evm/live.ts";
+import { traderTokenBalance } from "./execution/evm/live.ts";
+import { evmFillFetcher, evmTxStatusFetcher } from "./execution/evm/reconcile.ts";
+import { fetchConfirmedFill, traderSplTokenBalance } from "./execution/solana/fills.ts";
 import { traderPublicKey } from "./execution/solana/signer.ts";
 import { getSolanaConnection } from "./execution/solana/client.ts";
 import { getSolanaTokenDecimals } from "./execution/solana/helius.ts";
@@ -65,11 +70,53 @@ export interface LiveDeps {
 }
 
 const jupiter = new JupiterExecutor();
+const zeroex = new ZeroExExecutor();
 let journal: LiveOrder[] = [];
 let mirror: LivePosition[] = [];
 
+function isEvmChain(chain: string): boolean {
+  return EVM_CHAIN_IDS[chain] !== undefined;
+}
+
+/** Live execution covers Solana and every EVM chain (0x for quotes+swaps). */
 function liveChain(chain: string): boolean {
-  return liveTradingEnabled() && chain === "solana";
+  return liveTradingEnabled() && (chain === "solana" || isEvmChain(chain));
+}
+
+function takerFor(chain: string): string {
+  return chain === "solana" ? traderPublicKey() : traderEvmAddress();
+}
+
+function liveQuoteRequest(
+  chain: string,
+  input: { sellToken: string; buyToken: string; sellAmountBaseUnits: string; slippageBps: number },
+) {
+  return {
+    chain,
+    ...(isEvmChain(chain) ? { chainId: EVM_CHAIN_IDS[chain] } : {}),
+    sellToken: input.sellToken,
+    buyToken: input.buyToken,
+    sellAmountBaseUnits: input.sellAmountBaseUnits,
+    taker: takerFor(chain),
+    slippageBps: input.slippageBps,
+  };
+}
+
+/** Token decimals: on-chain first, well-known quote map as fallback. */
+async function tokenDecimalsFor(chain: string, mint: string): Promise<number | null> {
+  try {
+    if (chain === "solana") return await getSolanaTokenDecimals(mint);
+    if (/^0x0{40}$/i.test(mint)) return 18;
+    return await getEvmTokenDecimals(chain, mint as `0x${string}`);
+  } catch {
+    return null;
+  }
+}
+
+async function buyDecimalsFor(chain: string, mint: string, symbol: string): Promise<number | null> {
+  const onchain = await tokenDecimalsFor(chain, mint);
+  if (onchain !== null) return onchain;
+  return KNOWN_QUOTE_DECIMALS[symbol.toLowerCase()] ?? null;
 }
 
 function saveAll(): void {
@@ -131,14 +178,6 @@ function quoteUsd(
   return { qp, qd };
 }
 
-async function tokenDecimals(mint: string): Promise<number | null> {
-  try {
-    return await getSolanaTokenDecimals(mint);
-  } catch {
-    return null;
-  }
-}
-
 function liveFillRow(
   position: Position,
   detail: "LIVE_OPEN" | `LIVE_TP${number}` | "LIVE_EXIT",
@@ -181,40 +220,38 @@ export async function initLive(
     restoreLiveState();
     journal = loadLiveOrders();
     mirror = loadLivePositions();
-    const connection = getSolanaConnection();
-    const trader = traderPublicKey();
+    const findOrder = (signature: string): LiveOrder | undefined =>
+      journal.find((o) => o.signature === signature);
     const report = await reconcileLiveState(journal, mirror, {
       getTxStatus: async (signature: string): Promise<ChainTxStatus> => {
-        const [st] = (await connection.getSignatureStatuses([signature])).value;
-        if (!st) return "missing";
-        if (st.err) return "failed";
-        return st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized"
-          ? "confirmed"
-          : "missing";
-      },
-      fetchFill: (signature: string) => fetchConfirmedFill(signature),
-      getBalance: async (mint: string): Promise<bigint | null> => {
-        try {
-          const accs = await connection.getParsedTokenAccountsByOwner(
-            new PublicKey(trader),
-            { mint: new PublicKey(mint) },
-          );
-          let total = 0n;
-          for (const a of accs.value) {
-            const amt = (a.account.data as unknown as { parsed?: { info?: { tokenAmount?: { amount?: unknown } } } })
-              ?.parsed?.info?.tokenAmount?.amount;
-            if (typeof amt === "string") {
-              try {
-                total += BigInt(amt);
-              } catch {
-                // Skip unparseable rows.
-              }
-            }
-          }
-          return total;
-        } catch {
-          return null;
+        const order = findOrder(signature);
+        const chain = order?.chain;
+        if (!chain) return "missing";
+        if (chain === "solana") {
+          const connection = getSolanaConnection();
+          const [st] = (await connection.getSignatureStatuses([signature])).value;
+          if (!st) return "missing";
+          if (st.err) return "failed";
+          return st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized"
+            ? "confirmed"
+            : "missing";
         }
+        if (isEvmChain(chain)) return evmTxStatusFetcher(chain)(signature);
+        return "missing";
+      },
+      fetchFill: (signature: string) => {
+        const order = findOrder(signature);
+        const chain = order?.chain;
+        if (chain === "solana") return fetchConfirmedFill(signature);
+        if (chain !== undefined && isEvmChain(chain)) {
+          return evmFillFetcher(chain, (sig) => journal.find((o) => o.signature === sig))(signature);
+        }
+        return Promise.reject(new Error(`No fill fetcher for chain ${chain ?? "unknown"}`));
+      },
+      getBalance: (chain: string, mint: string): Promise<bigint | null> => {
+        if (chain === "solana") return traderSplTokenBalance(mint);
+        if (isEvmChain(chain)) return traderTokenBalance(chain, mint);
+        return Promise.resolve(null);
       },
     });
     journal = report.orders;
@@ -285,36 +322,46 @@ export async function maybeLiveEnter(
 ): Promise<void> {
   if (!liveChain(position.chain)) return;
   const id = position.id;
+  const evm = isEvmChain(position.chain);
+  const quoter = evm ? zeroex : jupiter;
   try {
-    journal = recordSignal(journal, { positionId: id, chain: position.chain, side: "BUY" });
-    saveLiveOrders(journal);
-    trackPending(id, true);
-    const trader = traderPublicKey();
+    const quoteSellToken = pair.quoteToken.address;
     const basis = quoteUsd(entryPrice, pair);
     if (!basis) throw new Error("no live quote basis (unknown quote price/decimals)");
     const sellBase = usdToBaseUnits(sizeUsd / basis.qp, basis.qd);
-    const quote = await jupiter.quoteBuy({
+    journal = recordSignal(journal, {
+      positionId: id,
       chain: position.chain,
-      sellToken: pair.quoteToken.address,
+      side: "BUY",
+      // Receipt recovery needs the pair on EVM orders.
+      ...(evm
+        ? { meta: { sellToken: quoteSellToken, buyToken: position.tokenAddress, sellAmountBaseUnits: sellBase } }
+        : {}),
+    });
+    saveLiveOrders(journal);
+    trackPending(id, true);
+    const trader = takerFor(position.chain);
+    const quote = await quoter.quoteBuy(liveQuoteRequest(position.chain, {
+      sellToken: quoteSellToken,
       buyToken: position.tokenAddress,
       sellAmountBaseUnits: sellBase,
-      taker: trader,
       slippageBps: config.entry.slippageBps,
-    });
-    const res = await jupiter.buy({
-      quote,
-      taker: trader,
-      slippageBps: config.entry.slippageBps,
-      sizeUsd,
-      positionId: id,
-    });
+    }));
+    const res = await (evm
+      ? zeroex.buy({ quote, taker: trader, slippageBps: config.entry.slippageBps, sizeUsd, positionId: id })
+      : jupiter.buy({ quote, taker: trader, slippageBps: config.entry.slippageBps, sizeUsd, positionId: id }));
     if (!res.hash) throw new Error("live buy returned no signature");
     journal = markSubmitted(journal, id, "BUY", res.hash);
     saveLiveOrders(journal);
     await deps.notify(buildLiveSubmittedMessage({
       symbol: position.symbol, chain: position.chain, side: "BUY", sizeUsd, signature: res.hash,
     }));
-    const fill = await fetchConfirmedFill(res.hash);
+    // Confirmed fill, independent of the executor's own parse: Solana
+    // re-reads the transaction; EVM amounts already come receipt-parsed
+    // out of buy().
+    const fill = evm
+      ? { buyMint: position.tokenAddress, sellAmountBaseUnits: res.sellAmount, buyAmountBaseUnits: res.buyAmount }
+      : await fetchConfirmedFill(res.hash);
     if (fill.buyMint.toLowerCase() !== position.tokenAddress.toLowerCase()) {
       throw new Error(`fill token mismatch: ${fill.buyMint} vs ${position.tokenAddress}`);
     }
@@ -329,7 +376,7 @@ export async function maybeLiveEnter(
     journal = markConfirmed(journal, id, "BUY");
     saveLiveOrders(journal);
     trackPending(id, false);
-    const dec = await tokenDecimals(fill.buyMint);
+    const dec = await tokenDecimalsFor(position.chain, fill.buyMint);
     const qty = dec === null ? position.quantity : Number(BigInt(fill.buyAmountBaseUnits)) / 10 ** dec;
     const price = dec === null || qty <= 0 ? entryPrice : sizeUsd / qty;
     await recordFill(liveFillRow(position, "LIVE_OPEN", price, qty, sizeUsd));
@@ -362,25 +409,34 @@ async function liveSellFlow(
   sizeUsdForReport: number,
 ): Promise<void> {
   const id = position.id;
+  const evm = isEvmChain(position.chain);
+  const quoter = evm ? zeroex : jupiter;
   const live = mirror.find((p) => p.positionId === id && p.status === "OPEN");
   if (!live) {
     deps.log(`⚠️ live sell ${id}: no open live position (paper-only or never filled live)`);
     return;
   }
   try {
-    journal = recordSignal(journal, { positionId: id, chain: position.chain, side: "SELL" });
+    journal = recordSignal(journal, {
+      positionId: id,
+      chain: position.chain,
+      side: "SELL",
+      ...(evm
+        ? { meta: { sellToken: position.tokenAddress, buyToken: pair.quoteToken.address, sellAmountBaseUnits: sellBaseUnits.toString() } }
+        : {}),
+    });
     saveLiveOrders(journal);
     trackPending(id, true);
-    const trader = traderPublicKey();
-    const quote = await jupiter.quoteSell({
-      chain: position.chain,
+    const trader = takerFor(position.chain);
+    const quote = await quoter.quoteSell(liveQuoteRequest(position.chain, {
       sellToken: position.tokenAddress,
       buyToken: pair.quoteToken.address,
       sellAmountBaseUnits: sellBaseUnits.toString(),
-      taker: trader,
       slippageBps: config.entry.slippageBps,
-    });
-    const res = await jupiter.sell({ quote, taker: trader, slippageBps: config.entry.slippageBps });
+    }));
+    const res = evm
+      ? await zeroex.sell({ quote, taker: trader, slippageBps: config.entry.slippageBps })
+      : await jupiter.sell({ quote, taker: trader, slippageBps: config.entry.slippageBps });
     if (!res.hash) throw new Error("live sell returned no signature");
     journal = markSubmitted(journal, id, "SELL", res.hash);
     saveLiveOrders(journal);
@@ -389,7 +445,11 @@ async function liveSellFlow(
       sizeUsd: sizeUsdForReport,
       signature: res.hash,
     }));
-    const fill = await fetchConfirmedFill(res.hash);
+    // Confirmed fill, independent of the executor's own parse on Solana;
+    // EVM amounts already come receipt-parsed out of sell().
+    const fill = evm
+      ? { sellAmountBaseUnits: res.sellAmount, buyAmountBaseUnits: res.buyAmount }
+      : await fetchConfirmedFill(res.hash);
     const applied = applyLiveFill(mirror, id, fill.sellAmountBaseUnits);
     mirror = applied;
     saveLivePositions(mirror);
@@ -398,9 +458,9 @@ async function liveSellFlow(
     trackPending(id, false);
     // Actual USD proceeds from the confirmed buy (quote) currency.
     const basis = quoteUsd(paperPrice, pair);
-    const buyDec = KNOWN_QUOTE_DECIMALS[position.quoteSymbol.toLowerCase()];
+    const buyDec = await buyDecimalsFor(position.chain, pair.quoteToken.address, position.quoteSymbol);
     let proceedsUsd = 0;
-    if (basis && buyDec !== undefined) {
+    if (basis && buyDec !== null) {
       proceedsUsd = (Number(BigInt(fill.buyAmountBaseUnits)) / 10 ** buyDec) * basis.qp;
     }
     const realized = realizedShare(

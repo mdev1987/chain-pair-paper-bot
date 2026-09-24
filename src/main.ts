@@ -47,7 +47,7 @@ import {
   SIM_ZERO_TAKER,
   simulateSwap,
 } from "./execution/simulate.ts";
-import { EVM_CHAIN_IDS } from "./execution/evm/viem-client.ts";
+import { EVM_CHAIN_IDS, evmRpcSources } from "./execution/evm/viem-client.ts";
 import { initLive, maybeLiveEnter, maybeLiveExit, maybeLiveTp } from "./live.ts";
 import { maybeLiveTestTrade } from "./live-test.ts";
 
@@ -810,6 +810,12 @@ async function main(): Promise<void> {
   // aggregator-free (direct V2/V4 only). Without a Jupiter key, Solana
   // still quotes (Ultra is keyless) — the key only raises rate limits.
   console.log(`0x key              : ${process.env.ZEROEX_API_KEY ? "present (EVM aggregator quotes on)" : "absent (direct-V2/V4 quotes only)"}`);
+  const rpcSources = evmRpcSources();
+  console.log(`EVM RPCs            : ${Object.entries(rpcSources).map(([c, s]) => `${c}=${s}`).join(", ")}`);
+  const fragileRpcs = Object.entries(rpcSources).filter(([, s]) => s === "none" || s === "public");
+  if (fragileRpcs.length > 0) {
+    log(`⚠️ EVM chains on fallback/missing RPCs (${fragileRpcs.map(([c, s]) => `${c}=${s}`).join(", ")}) — set EVM_RPC_URLS before any live trading`);
+  }
   console.log(`Jupiter key         : ${process.env.JUPITER_API_KEY ? "present" : "absent (Ultra quotes still work, lower rate limit)"}`);
   console.log(`Live trading        : ${process.env.LIVE_TRADING_ENABLED === "true" ? "ENABLED — real funds at risk" : "off (paper only)"}`);
   console.log(`Recovery            : ${config.recovery.enabled ? config.recovery.stateFile : "disabled"}`);

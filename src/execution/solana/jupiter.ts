@@ -9,6 +9,8 @@ import type {
 import { requireLive } from "../types.ts";
 import { VersionedTransaction, type Keypair } from "@solana/web3.js";
 import { loadTraderKeypair, traderPublicKey } from "./signer.ts";
+import { getSolanaConnection } from "./client.ts";
+import { traderSplTokenBalance } from "./fills.ts";
 import { checkBuyPreconditions, maxSizeFor } from "../live-guard.ts";
 import { assessQuoteRisk } from "../risk.ts";
 import { SIM_RISK_POLICY } from "../simulate.ts";
@@ -205,13 +207,51 @@ export async function executeJupiterSwap(request: QuoteRequest): Promise<Jupiter
     throw new Error("Jupiter order built no transaction (unindexed or unbuildable route)");
   }
   if (!order.requestId) throw new Error("Jupiter order missing requestId");
+  await assertSellBalance(request.sellToken, request.sellAmountBaseUnits);
   const signed = signJupiterOrder(order.transaction);
+  await preflightSigned(signed);
   const result = await executeJupiterOrder(signed, order.requestId);
   return {
     signature: result.signature as string,
     sellAmount: result.totalInputAmount ?? String(order.inAmount ?? request.sellAmountBaseUnits),
     buyAmount: result.totalOutputAmount ?? String(order.outAmount ?? "0"),
   };
+}
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+/**
+ * Pre-submit balance precheck: clear "insufficient funds" beats an
+ * obscure /execute failure and a stuck SUBMITTED journal entry.
+ */
+async function assertSellBalance(sellToken: string, sellAmountBaseUnits: string): Promise<void> {
+  const need = BigInt(sellAmountBaseUnits);
+  if (sellToken === SOL_MINT) {
+    const { PublicKey } = await import("@solana/web3.js");
+    const lamports = await getSolanaConnection().getBalance(new PublicKey(traderPublicKey()));
+    if (BigInt(lamports) < need) {
+      throw new Error(`Insufficient SOL balance for live swap (need ${need} lamports)`);
+    }
+    return;
+  }
+  const bal = await traderSplTokenBalance(sellToken);
+  if (bal === null) throw new Error("Sell-token balance unreadable (RPC?) — refusing submit");
+  if (bal < need) {
+    throw new Error(`Insufficient token balance for live swap (need ${need}, have ${bal})`);
+  }
+}
+
+/**
+ * Local preflight: simulate the signed transaction before handing it to
+ * /execute. Catches bad blockhashes and doomed transactions without
+ * spending anything or polluting the journal with failed submits.
+ */
+async function preflightSigned(signedB64: string): Promise<void> {
+  const tx = VersionedTransaction.deserialize(Buffer.from(signedB64, "base64"));
+  const sim = await getSolanaConnection().simulateTransaction(tx, { commitment: "confirmed" });
+  if (sim.value.err) {
+    throw new Error(`Preflight simulation failed, refusing submit: ${JSON.stringify(sim.value.err).slice(0, 200)}`);
+  }
 }
 
 /**

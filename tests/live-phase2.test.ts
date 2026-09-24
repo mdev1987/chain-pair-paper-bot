@@ -127,6 +127,22 @@ describe("pending-order journal", () => {
     assert.deepEqual(loadLiveOrders(path), []);
     assert.deepEqual(loadLiveOrders(join(dir, "missing.json")), []);
   });
+
+  test("signal meta (EVM token pair) persists for receipt recovery", () => {
+    const path = join(dir, "orders-meta.json");
+    const meta = { sellToken: "0xaaa", buyToken: "0xbbb", sellAmountBaseUnits: "1000" };
+    const orders = recordSignal([], {
+      positionId: "robinhood:X", chain: "robinhood", side: "SELL", meta,
+    });
+    saveLiveOrders(orders, path);
+    const [loaded] = loadLiveOrders(path);
+    assert.deepEqual(loaded!.meta, meta);
+    // Meta survives transitions and garbage meta is dropped on load.
+    const moved = markSubmitted(orders, "robinhood:X", "SELL", "0xsig");
+    assert.deepEqual(moved[0]!.meta, meta);
+    writeFileSync(path, JSON.stringify([{ ...moved[0], meta: { sellToken: 42 } }]), "utf8");
+    assert.deepEqual(loadLiveOrders(path), []);
+  });
 });
 
 describe("live position mirror", () => {
@@ -235,7 +251,7 @@ describe("startup reconciliation", () => {
           buyMint: "B", buyAmountBaseUnits: "9", feeLamports: "5000",
         };
       },
-      getBalance: async (mint: string) => (mint === MINT_A ? 500n : null),
+      getBalance: async (_chain: string, mint: string) => (mint === MINT_A ? 500n : null),
     };
     const positions = openLivePosition([], {
       positionId: "p9", chain: "solana", tokenMint: MINT_A, filledBaseUnits: "1000",

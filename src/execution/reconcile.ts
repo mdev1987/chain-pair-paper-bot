@@ -34,8 +34,8 @@ export interface ReconcileDeps {
   getTxStatus: (signature: string) => Promise<ChainTxStatus>;
   /** Actual fill for a confirmed signature (fetchConfirmedFill). */
   fetchFill: (signature: string) => Promise<ConfirmedFill>;
-  /** Trader's current balance of a mint, base units (null when unreadable). */
-  getBalance: (mint: string) => Promise<bigint | null>;
+  /** Trader's current balance of a mint on a chain, base units (null when unreadable). */
+  getBalance: (chain: string, mint: string) => Promise<bigint | null>;
 }
 
 export interface ReconciledFill {
@@ -108,7 +108,7 @@ export async function reconcileLiveState(
   for (const position of positions) {
     if (position.status !== "OPEN") continue;
     try {
-      const onchain = await deps.getBalance(position.tokenMint);
+      const onchain = await deps.getBalance(position.chain, position.tokenMint);
       if (onchain === null) continue;
       if (onchain.toString() !== position.remainingBaseUnits) {
         report.discrepancies.push(
