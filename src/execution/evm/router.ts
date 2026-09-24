@@ -41,10 +41,13 @@ export async function routeQuote(
 ): Promise<Quote> {
   const quotes: Quote[] = [];
   const errors: string[] = [];
+  const skipped: string[] = [];
   for (const adapter of adapters) {
     // ZeroEx without a key always fails — skip the wasted round-trip.
+    // Skips are appended AFTER real adapter errors so the diagnostic
+    // signal (which gets truncated downstream) survives in the note.
     if (adapter.name === "0x" && !process.env.ZEROEX_API_KEY) {
-      errors.push("0x: ZEROEX_API_KEY is not configured");
+      skipped.push("0x: ZEROEX_API_KEY is not configured");
       continue;
     }
     try {
@@ -59,7 +62,7 @@ export async function routeQuote(
   }
   const best = selectBestQuote(quotes);
   if (!best) {
-    throw new Error(`No quotable route for ${request.sellToken} -> ${request.buyToken}: ${errors.join("; ")}`);
+    throw new Error(`No quotable route for ${request.sellToken} -> ${request.buyToken}: ${[...errors, ...skipped].join("; ")}`);
   }
   return best;
 }

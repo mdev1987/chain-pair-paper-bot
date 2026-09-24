@@ -98,10 +98,11 @@ export function directV2SkipReason(pairAddress?: string): string | null {
 /**
  * True when a quote-check note reports a drained/uninitialized pool, i.e.
  * the paper fill may overstate an exit that was unfillable on-chain.
- * Pure — tested, and reused by the drained-exit ledger flag.
+ * Includes the truncated form ("…uniswap-v4: Error: V4 n") produced by
+ * older note-length caps. Pure — tested, reused by the drained-exit flag.
  */
 export function quoteNoteIndicatesDrained(note: string): boolean {
-  return /no active liquidity|pool uninitialized|empty slot0/i.test(note);
+  return /no active liquidity|pool uninitialized|empty slot0|uniswap-v4: Error: V4 n/i.test(note);
 }
 
 export interface SimCheckInput {
@@ -166,7 +167,7 @@ export async function simulateSwap(input: SimCheckInput): Promise<SimCheckResult
     quote = await routeQuote(adapters, request, input.side === "BUY" ? "buy" : "sell");
   } catch (error) {
     const skip = v2Skip ? `; ${v2Skip}` : "";
-    return skipped(`no-quotable-route: ${String(error).slice(0, 180)}${skip}`);
+    return skipped(`no-quotable-route: ${String(error).slice(0, 400)}${skip}`);
   }
 
   const risk = assessQuoteRisk(quote, SIM_RISK_POLICY);

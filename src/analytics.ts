@@ -221,7 +221,8 @@ async function openConnection(dbPath: string): Promise<DuckDBConnection> {
     await connection.run(
       `UPDATE trades SET drained_exit = TRUE WHERE drained_exit IS NOT TRUE
        AND position_id IN (SELECT position_id FROM quote_checks WHERE side = 'SELL'
-       AND (note ILIKE '%no active liquidity%' OR note ILIKE '%uninitialized%'))`,
+       AND (note ILIKE '%no active liquidity%' OR note ILIKE '%uninitialized%'
+         OR note ILIKE '%uniswap-v4: Error: V4 n%'))`,
     );
   } catch {
     // Best-effort: fresh ledgers simply have no matching rows.

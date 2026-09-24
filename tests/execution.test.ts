@@ -245,6 +245,35 @@ describe("quote-check regression fixes", () => {
     assert.equal(jupiterTakerParam(sol), sol);
   });
 
+  test("routeQuote lists real adapter errors before 0x skips", async () => {
+    const prev = process.env.ZEROEX_API_KEY;
+    delete process.env.ZEROEX_API_KEY;
+    const zeroex: QuoteAdapter = {
+      name: "0x",
+      quoteBuy: async () => { throw new Error("should not be called"); },
+      quoteSell: async () => { throw new Error("should not be called"); },
+    };
+    const failing: QuoteAdapter = {
+      name: "uniswap-v4",
+      quoteBuy: async () => { throw new Error("V4 no active liquidity at current tick"); },
+      quoteSell: async () => { throw new Error("V4 no active liquidity at current tick"); },
+    };
+    try {
+      await assert.rejects(
+        routeQuote([zeroex, failing], { ...REQ, chain: "robinhood", chainId: 4663 }, "sell"),
+        (error: unknown) => {
+          const message = String(error);
+          const v4At = message.indexOf("uniswap-v4:");
+          const skAt = message.indexOf("0x: ZEROEX_API_KEY");
+          assert.ok(v4At !== -1 && skAt !== -1 && v4At < skAt, message);
+          return true;
+        },
+      );
+    } finally {
+      if (prev !== undefined) process.env.ZEROEX_API_KEY = prev;
+    }
+  });
+
   test("routeQuote skips 0x when ZEROEX_API_KEY is unset", async () => {
     const prev = process.env.ZEROEX_API_KEY;
     delete process.env.ZEROEX_API_KEY;

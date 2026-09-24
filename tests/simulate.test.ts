@@ -67,7 +67,8 @@ describe("simulation helpers", () => {
   test("drained-note matcher flags unfillable exits only", () => {
     assert.equal(quoteNoteIndicatesDrained("uniswap-v4: Error: V4 no active liquidity at current tick"), true);
     assert.equal(quoteNoteIndicatesDrained("V4 pool uninitialized (empty slot0)"), true);
-    assert.equal(quoteNoteIndicatesDrained("no-quotable-route: 0x: ZEROEX_API_KEY is not configured"), false);
+    assert.equal(quoteNoteIndicatesDrained("no-quotable-route: Error: No quotable route for 0x777 -> 0x000: 0x: ZEROEX_API_KEY is not configured; uniswap-v4: Error: V4 n"), true);
+    assert.equal(quoteNoteIndicatesDrained("no-quotable-route: Error: No quotable route for 0x622 -> 0x000: 0x: ZEROEX_API_KEY is not configured"), false);
     assert.equal(quoteNoteIndicatesDrained("uniswap | eth-call-revert: TRANSFER_FROM_FAILED"), false);
     assert.equal(quoteNoteIndicatesDrained(""), false);
   });
