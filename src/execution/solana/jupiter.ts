@@ -4,8 +4,14 @@ import type {
   QuoteRequest,
   SimulationResult,
   SwapExecutor,
+  SwapRequest,
 } from "../types.ts";
 import { requireLive } from "../types.ts";
+import { VersionedTransaction, type Keypair } from "@solana/web3.js";
+import { loadTraderKeypair, traderPublicKey } from "./signer.ts";
+import { checkBuyPreconditions, maxSizeFor } from "../live-guard.ts";
+import { assessQuoteRisk } from "../risk.ts";
+import { SIM_RISK_POLICY } from "../simulate.ts";
 
 /**
  * Jupiter Swap API V2 adapter (Solana) — Meta-Aggregator path.
@@ -116,10 +122,102 @@ export async function fetchJupiterOrder(
   return (await response.json()) as JupiterOrderResponse;
 }
 
+export interface JupiterExecuteResponse {
+  status?: string;
+  signature?: string;
+  slot?: string;
+  error?: string;
+  code?: number;
+  /** Actual wallet deltas — the basis for fill extraction (Phase 1.2). */
+  totalInputAmount?: string;
+  totalOutputAmount?: string;
+  inputAmountResult?: string;
+  outputAmountResult?: string;
+}
+
 /**
- * quote is live (keyless or JUPITER_API_KEY); simulate/buy/sell stay gated.
- * Stage 1 work: sign order.transaction (web3.js/kit) and POST /execute with
- * { signedTransaction, requestId }.
+ * Deserialize a /order transaction and sign it with the trader keypair.
+ * Offline-capable (no network). Throws on missing/malformed input.
+ */
+export function signJupiterOrder(
+  transactionB64: string,
+  signer: Keypair = loadTraderKeypair(),
+): string {
+  if (!transactionB64) throw new Error("Jupiter order has no transaction to sign");
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(transactionB64, "base64");
+  } catch {
+    throw new Error("Jupiter transaction is not valid base64");
+  }
+  if (bytes.length === 0) throw new Error("Jupiter transaction is empty");
+  let tx: VersionedTransaction;
+  try {
+    tx = VersionedTransaction.deserialize(bytes);
+  } catch (error) {
+    throw new Error(`Jupiter transaction malformed: ${String(error).slice(0, 120)}`);
+  }
+  tx.sign([signer]);
+  return Buffer.from(tx.serialize()).toString("base64");
+}
+
+/**
+ * POST /execute: Jupiter lands the signed tx (managed priority fees,
+ * confirmation polling, retries) and returns the signature plus actual
+ * wallet deltas. Throws when status is not Success.
+ */
+export async function executeJupiterOrder(
+  signedTransaction: string,
+  requestId: string,
+): Promise<JupiterExecuteResponse> {
+  if (!requestId) throw new Error("Jupiter execute needs the /order requestId");
+  const response = await fetch(`${JUPITER_V2_BASE}/execute`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...apiKeyHeader() },
+    body: JSON.stringify({ signedTransaction, requestId }),
+  });
+  if (!response.ok) {
+    throw new Error(`Jupiter execute HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
+  }
+  const result = (await response.json()) as JupiterExecuteResponse;
+  if (result.status !== "Success" || !result.signature) {
+    throw new Error(
+      `Jupiter execute ${result.status ?? "Failed"} [${result.code ?? "?"}]: ${(result.error ?? "unknown").slice(0, 300)}`,
+    );
+  }
+  return result;
+}
+
+export interface JupiterLiveFill {
+  signature: string;
+  sellAmount: string;
+  buyAmount: string;
+}
+
+/**
+ * Full live flow: /order (trader as taker) → sign → /execute → verified
+ * amounts from the execution result (preferred) or the order quote.
+ * Throws on any failure — callers must not assume a fill.
+ */
+export async function executeJupiterSwap(request: QuoteRequest): Promise<JupiterLiveFill> {
+  const order = await fetchJupiterOrder({ ...request, taker: traderPublicKey() });
+  if (!order.transaction) {
+    throw new Error("Jupiter order built no transaction (unindexed or unbuildable route)");
+  }
+  if (!order.requestId) throw new Error("Jupiter order missing requestId");
+  const signed = signJupiterOrder(order.transaction);
+  const result = await executeJupiterOrder(signed, order.requestId);
+  return {
+    signature: result.signature as string,
+    sellAmount: result.totalInputAmount ?? String(order.inAmount ?? request.sellAmountBaseUnits),
+    buyAmount: result.totalOutputAmount ?? String(order.outAmount ?? "0"),
+  };
+}
+
+/**
+ * quote is live (keyless or JUPITER_API_KEY). buy/sell execute for real
+ * behind requireLive + the buy safety invariant (live-guard.ts).
+ * Exits bypass the entry gate but never the live flag.
  */
 export class JupiterExecutor implements SwapExecutor {
   readonly name = "jupiter";
@@ -136,13 +234,48 @@ export class JupiterExecutor implements SwapExecutor {
     throw new Error("Jupiter adapter has no local simulate yet (Stage 1: sign order.transaction, POST /execute)");
   }
 
-  async buy(): Promise<ExecutionResult> {
+  async buy(
+    request: SwapRequest & { sizeUsd?: number; positionId?: string },
+  ): Promise<ExecutionResult> {
     requireLive("Jupiter buy");
-    throw new Error("unreachable");
+    // Safety invariant: every condition must pass, else NO TRANSACTION.
+    // Fail-closed on size: live callers must state the USD size.
+    const risk = assessQuoteRisk(request.quote, SIM_RISK_POLICY);
+    const sizeUsd = request.sizeUsd ?? NaN;
+    const verdict = checkBuyPreconditions({
+      chain: request.quote.chain,
+      sizeUsd,
+      riskPass: risk.pass,
+      simOk: null, // Solana/Jupiter: no local simulate; /execute confirms instead.
+      quoteSource: request.quote.source,
+      ...(request.positionId !== undefined ? { positionId: request.positionId } : {}),
+    });
+    if (!verdict.ok) {
+      throw new Error(`Live buy refused: ${verdict.failures.join("; ")}`);
+    }
+    const fill = await executeJupiterSwap({
+      chain: request.quote.chain,
+      sellToken: request.quote.sellToken,
+      buyToken: request.quote.buyToken,
+      sellAmountBaseUnits: request.quote.sellAmount,
+      taker: request.taker,
+      slippageBps: request.slippageBps,
+    });
+    return { ok: true, hash: fill.signature, sellAmount: fill.sellAmount, buyAmount: fill.buyAmount };
   }
 
-  async sell(): Promise<ExecutionResult> {
+  async sell(request: SwapRequest): Promise<ExecutionResult> {
+    // Exits bypass the entry gate (positions must always be exitable) but
+    // never the live flag.
     requireLive("Jupiter sell");
-    throw new Error("unreachable");
+    const fill = await executeJupiterSwap({
+      chain: request.quote.chain,
+      sellToken: request.quote.sellToken,
+      buyToken: request.quote.buyToken,
+      sellAmountBaseUnits: request.quote.sellAmount,
+      taker: request.taker,
+      slippageBps: request.slippageBps,
+    });
+    return { ok: true, hash: fill.signature, sellAmount: fill.sellAmount, buyAmount: fill.buyAmount };
   }
 }

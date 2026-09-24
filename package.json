@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@duckdb/node-api": "^1.5.5-r.5",
+    "@solana/web3.js": "^1.99.0",
     "dexpaprika-sdk": "1.10.0",
     "grammy": "1.46.0",
     "telegram-markdown-v2": "0.0.5",
