@@ -275,3 +275,62 @@ describe("live telegram builders", () => {
     assert.ok(fill.includes("+$1.50"));
   });
 });
+
+describe("round-trip harness planner and math", () => {
+  test("nextTestStep resumes and completes exactly once", async () => {
+    const { nextTestStep, TEST_ID } = await import("../src/live-test.ts");
+    assert.deepEqual(nextTestStep([]), { kind: "buy" });
+    const signaled = recordSignal([], { positionId: TEST_ID, chain: "solana", side: "BUY" });
+    assert.deepEqual(nextTestStep(signaled), { kind: "buy" });
+    const submitted = markSubmitted(signaled, TEST_ID, "BUY", "sig1");
+    assert.deepEqual(nextTestStep(submitted), { kind: "resume-buy", signature: "sig1" });
+    const bDone = markConfirmed(submitted, TEST_ID, "BUY");
+    assert.deepEqual(nextTestStep(bDone), { kind: "sell" });
+    const sSub = markSubmitted(
+      [...bDone, ...recordSignal([], { positionId: TEST_ID, chain: "solana", side: "SELL" })],
+      TEST_ID, "SELL", "sig2",
+    );
+    assert.deepEqual(nextTestStep(sSub), { kind: "resume-sell", signature: "sig2" });
+    const allDone = markConfirmed(sSub, TEST_ID, "SELL");
+    assert.deepEqual(nextTestStep(allDone), { kind: "done" });
+    // SELL confirmed without BUY: nothing to do, never rerun.
+    const sellOnly = markConfirmed(
+      markSubmitted(
+        recordSignal([], { positionId: TEST_ID, chain: "solana", side: "SELL" }),
+        TEST_ID, "SELL", "sig9",
+      ),
+      TEST_ID, "SELL",
+    );
+    assert.deepEqual(nextTestStep(sellOnly), { kind: "done" });
+  });
+
+  test("lamportsForUsd converts and refuses garbage prices", async () => {
+    const { lamportsForUsd } = await import("../src/live-test.ts");
+    // $5 @ $200/SOL = 0.025 SOL = 25_000_000 lamports.
+    assert.equal(lamportsForUsd(200, 5), "25000000");
+    assert.throws(() => lamportsForUsd(0, 5), /Invalid SOL price/);
+    assert.throws(() => lamportsForUsd(NaN, 5), /Invalid SOL price/);
+    assert.throws(() => lamportsForUsd(1e18, 5), /zero lamports/);
+  });
+
+  test("sellFillStatus distinguishes fresh/applied/conflict", async () => {
+    const { sellFillStatus } = await import("../src/execution/live-positions.ts");
+    const pos = {
+      positionId: "x", chain: "solana", tokenMint: "M",
+      remainingBaseUnits: "1000", filledBaseUnits: "1000",
+      originalBaseUnits: "1000", entryCostUsd: 5,
+      status: "OPEN" as const, openedAt: 1, updatedAt: 1,
+    };
+    assert.equal(sellFillStatus(pos, "250"), "fresh");
+    assert.equal(
+      sellFillStatus({ ...pos, remainingBaseUnits: "750" }, "250"),
+      "applied",
+    );
+    assert.equal(
+      sellFillStatus({ ...pos, remainingBaseUnits: "600" }, "250"),
+      "conflict",
+    );
+    assert.throws(() => sellFillStatus(pos, "abc"), /Invalid fill amount/);
+    assert.throws(() => sellFillStatus(pos, "0"), /positive/);
+  });
+});

@@ -49,6 +49,7 @@ import {
 } from "./execution/simulate.ts";
 import { EVM_CHAIN_IDS } from "./execution/evm/viem-client.ts";
 import { initLive, maybeLiveEnter, maybeLiveExit, maybeLiveTp } from "./live.ts";
+import { maybeLiveTestTrade } from "./live-test.ts";
 
 const seenPools = new Map<string, number>();
 const candidates = new Map<string, Candidate>();
@@ -825,6 +826,9 @@ async function main(): Promise<void> {
   // the kill switch, reloads journals, and resolves every open live order
   // from on-chain status before trading resumes.
   await initLive({ notify, log }, positions);
+
+  // One-shot $5 round-trip self-test (no-op unless LIVE_TEST_TRADE=true).
+  await maybeLiveTestTrade({ notify, log });
 
   if (config.telegram.enabled) {
     await testTelegram();

@@ -182,6 +182,31 @@ export function countOpenLive(positions: LivePosition[]): number {
 }
 
 /**
+ * Crash-restart idempotency for SELL fills: was this exact fill already
+ * applied to the mirror?
+ * - "fresh": remainder untouched (equals original) → safe to apply.
+ * - "applied": remainder already reduced by exactly this fill → skip.
+ * - "conflict": neither — partial state needing operator review, never guess.
+ */
+export function sellFillStatus(
+  position: LivePosition,
+  fillSellBaseUnits: string,
+): "fresh" | "applied" | "conflict" {
+  let sold: bigint;
+  try {
+    sold = BigInt(fillSellBaseUnits);
+  } catch {
+    throw new Error(`Invalid fill amount: ${fillSellBaseUnits}`);
+  }
+  if (sold <= 0n) throw new Error("Fill amount must be positive");
+  const remaining = BigInt(position.remainingBaseUnits);
+  const original = BigInt(position.originalBaseUnits);
+  if (remaining === original) return "fresh";
+  if (remaining === original - sold) return "applied";
+  return "conflict";
+}
+
+/**
  * Live TP sell quantity: the strategy fraction applied to the LIVE
  * original fill — never paper percentages on paper quantities (entry
  * drag makes them differ). Pure BigInt; throws on degenerate input.

@@ -36,6 +36,7 @@ import {
   openLivePosition,
   realizedShare,
   saveLivePositions,
+  sellFillStatus,
   type LivePosition,
 } from "./execution/live-positions.ts";
 import {
@@ -237,7 +238,25 @@ export async function initLive(
             });
           }
         } else {
-          mirror = applyLiveFill(mirror, order.positionId, fill.sellAmountBaseUnits);
+          // Crash window: the fill may already be saved without the
+          // CONFIRMED mark — never double-apply, never guess on conflict.
+          const existing = mirror.find((p) => p.positionId === order.positionId);
+          if (!existing || existing.status !== "OPEN") {
+            report.discrepancies.push(`${order.positionId}: confirmed SELL without open live position`);
+            continue;
+          }
+          switch (sellFillStatus(existing, fill.sellAmountBaseUnits)) {
+            case "fresh":
+              mirror = applyLiveFill(mirror, order.positionId, fill.sellAmountBaseUnits);
+              break;
+            case "applied":
+              break;
+            case "conflict":
+              report.discrepancies.push(
+                `${order.positionId}: SELL fill state conflict (remaining ${existing.remainingBaseUnits}, fill ${fill.sellAmountBaseUnits})`,
+              );
+              continue;
+          }
         }
       } catch (error) {
         report.discrepancies.push(`${order.positionId}: boot-apply failed: ${String(error).slice(0, 120)}`);
