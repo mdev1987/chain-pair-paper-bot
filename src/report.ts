@@ -213,3 +213,54 @@ export function buildStartupMessage(args: {
     ...(args.analytics ? [`📊 Analytics: ${args.analytics}`] : []),
   ].join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Live execution reports (Phase 1.6). Paper messages above are untouched;
+// these fire only for real-money fills. Amounts are base-unit strings —
+// callers scale for display via decimals they already resolved.
+// ---------------------------------------------------------------------------
+
+export interface LiveSubmitReport {
+  symbol: string;
+  chain: string;
+  side: "BUY" | "SELL";
+  sizeUsd: number;
+  signature: string;
+}
+
+export function buildLiveSubmittedMessage(r: LiveSubmitReport): string {
+  const badge = r.side === "BUY" ? "🟢 LIVE BUY SUBMITTED" : "🔴 LIVE SELL SUBMITTED";
+  return [
+    `### ${badge} — ${r.symbol}`,
+    `${chainIcon(r.chain)} ${r.chain}  |  💲 Size: ${fmtUsd(r.sizeUsd)}`,
+    `🔗 Signature: \`${r.signature}\``,
+    `[Solscan](https://solscan.io/tx/${r.signature})`,
+  ].join("\n");
+}
+
+export interface LiveFillReport {
+  symbol: string;
+  chain: string;
+  /** ENTRY, TP1/TP2/TP3 partial, or final EXIT (stop/trail/time). */
+  kind: "ENTRY" | "TP" | "EXIT";
+  level?: number;
+  price: number | null;
+  sellAmount: string;
+  buyAmount: string;
+  signature: string;
+  realizedPnlUsd?: number;
+}
+
+export function buildLiveFillConfirmedMessage(r: LiveFillReport): string {
+  const badge =
+    r.kind === "ENTRY" ? "🟢 LIVE BUY CONFIRMED" : r.kind === "TP" ? "💰 LIVE TP FILLED" : "🔴 LIVE EXIT FILLED";
+  const title = r.kind === "TP" && r.level !== undefined ? `${badge} (TP${r.level})` : `${badge} — ${r.symbol}`;
+  return [
+    `### ${title}`,
+    `${chainIcon(r.chain)} ${r.chain}  |  💲 Fill: ${r.price !== null ? fmtPrice(r.price) : "—"}`,
+    `📦 In: \`${r.sellAmount}\`  →  Out: \`${r.buyAmount}\``,
+    ...(r.realizedPnlUsd !== undefined ? [`📈 Realized PnL: ${fmtSignedUsd(r.realizedPnlUsd)}`] : []),
+    `🔗 Signature: \`${r.signature}\``,
+    `[Solscan](https://solscan.io/tx/${r.signature})`,
+  ].join("\n");
+}
