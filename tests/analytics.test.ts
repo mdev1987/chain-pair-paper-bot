@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   analyticsQuery,
   initAnalytics,
+  markTradeDrained,
   recordFill,
   recordSnapshot,
   recordTrade,
@@ -66,7 +67,7 @@ describe("duckdb trade ledger", () => {
       netPnlUsd: -1.7, costModel: "NET_PNL_100BPS_1PCT",
       mfePct: 30, maePct: -20, exitPct: -20, givebackPp: 50, timeToMfeS: 1,
       timeToMaeS: 2, exitTriggerPct: -15, gapThroughStop: true,
-      modeledFeeUsd: 0.1, modeledSlipUsd: 0.1,
+      modeledFeeUsd: 0.1, modeledSlipUsd: 0.1, drainedExit: false,
     });
 
     const fills = await analyticsQuery<Record<string, unknown>>(
@@ -82,7 +83,7 @@ describe("duckdb trade ledger", () => {
     assert.equal(fills[0]!.ca, "TOKENADDR123456789");
 
     const trades = await analyticsQuery<Record<string, unknown>>(
-      "SELECT symbol, reason, pnl_usd, tp_levels, entry_liquidity_usd, net_pnl_usd, cost_model, mfe_pct, mae_pct, exit_pct, giveback_pp, time_to_mfe_s, time_to_mae_s, exit_trigger_pct, gap_through_stop, modeled_fee_usd, modeled_slip_usd FROM trades",
+      "SELECT symbol, reason, pnl_usd, tp_levels, entry_liquidity_usd, net_pnl_usd, cost_model, mfe_pct, mae_pct, exit_pct, giveback_pp, time_to_mfe_s, time_to_mae_s, exit_trigger_pct, gap_through_stop, modeled_fee_usd, modeled_slip_usd, drained_exit FROM trades",
     );
     assert.equal(trades.length, 1);
     assert.equal(trades[0]!.reason, "TRAIL_EXIT");
@@ -102,6 +103,13 @@ describe("duckdb trade ledger", () => {
     assert.equal(trades[0]!.gap_through_stop, true);
     assert.equal(trades[0]!.modeled_fee_usd, 0.1);
     assert.equal(trades[0]!.modeled_slip_usd, 0.1);
+    assert.equal(trades[0]!.drained_exit, false);
+
+    await markTradeDrained("solana:PAIR");
+    const flagged = await analyticsQuery<Record<string, unknown>>(
+      "SELECT drained_exit FROM trades WHERE position_id = 'solana:PAIR'",
+    );
+    assert.equal(flagged[0]!.drained_exit, true);
 
     const wins = await analyticsQuery<{ wins: number | bigint }>(
       "SELECT count(*) FILTER (WHERE pnl_usd > 0) AS wins FROM trades",

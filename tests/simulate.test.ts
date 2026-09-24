@@ -5,6 +5,7 @@ import {
   directV2SkipReason,
   qtyToBaseUnits,
   quoteAdaptersFor,
+  quoteNoteIndicatesDrained,
   quotePriceUsd,
   simulateSwap,
   usdToBaseUnits,
@@ -61,6 +62,14 @@ describe("simulation helpers", () => {
     );
     assert.equal(directV2SkipReason(undefined), null);
     assert.equal(directV2SkipReason(""), null);
+  });
+
+  test("drained-note matcher flags unfillable exits only", () => {
+    assert.equal(quoteNoteIndicatesDrained("uniswap-v4: Error: V4 no active liquidity at current tick"), true);
+    assert.equal(quoteNoteIndicatesDrained("V4 pool uninitialized (empty slot0)"), true);
+    assert.equal(quoteNoteIndicatesDrained("no-quotable-route: 0x: ZEROEX_API_KEY is not configured"), false);
+    assert.equal(quoteNoteIndicatesDrained("uniswap | eth-call-revert: TRANSFER_FROM_FAILED"), false);
+    assert.equal(quoteNoteIndicatesDrained(""), false);
   });
 
   test("simulateSwap skips unsupported chains without network", async () => {

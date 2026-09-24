@@ -7,21 +7,33 @@ import type {
 } from "../types.ts";
 import { requireLive } from "../types.ts";
 
-const ZEROEX_BASE = "https://api.0x.org/swap/v1";
+// 0x Swap API v2 (allowance-holder). v1 was sunset 2025-04-11 — do not
+// revert to /swap/v1/* URLs. Docs: docs.0x.org, "getQuote (Allowance Holder)".
+const ZEROEX_BASE = "https://api.0x.org/swap/allowance-holder";
 
 interface ZeroExQuoteResponse {
+  liquidityAvailable?: boolean;
   sellToken?: string;
   buyToken?: string;
   sellAmount?: string;
   buyAmount?: string;
+  minBuyAmount?: string;
   gas?: string | number;
+  tokenMetadata?: {
+    buyToken?: { buyTaxBps?: string | number; sellTaxBps?: string | number };
+    sellToken?: { buyTaxBps?: string | number; sellTaxBps?: string | number };
+  };
+  transaction?: {
+    to?: string;
+    data?: string;
+    gas?: string | number;
+    gasPrice?: string;
+    value?: string;
+  };
+  // v1 leftovers: tolerated, never sent (endpoint is v2-only).
   to?: string;
   data?: string;
   value?: string;
-  tokenMetadata?: {
-    buyTaxBps?: string | number;
-    sellTaxBps?: string | number;
-  };
 }
 
 function numOrNull(value: unknown): number | null {
@@ -35,9 +47,13 @@ export function mapZeroExQuote(
   request: QuoteRequest,
   raw: ZeroExQuoteResponse,
 ): Quote {
+  if (raw.liquidityAvailable === false) {
+    throw new Error("0x reports no liquidity available for this pair");
+  }
   if (!raw.sellAmount || !raw.buyAmount) {
     throw new Error("0x response missing sellAmount/buyAmount (token may be unindexed)");
   }
+  const tx = raw.transaction ?? {};
   return {
     source: "0x",
     chain,
@@ -45,15 +61,15 @@ export function mapZeroExQuote(
     buyToken: String(raw.buyToken ?? request.buyToken),
     sellAmount: String(raw.sellAmount),
     buyAmount: String(raw.buyAmount),
-    // 0x v1 quote does not report a dedicated impact figure; downstream
+    // 0x v2 quote does not report a dedicated impact figure; downstream
     // risk assessment treats null as unknown (warn, don't block).
     priceImpactPct: null,
-    buyTaxBps: numOrNull(raw.tokenMetadata?.buyTaxBps),
-    sellTaxBps: numOrNull(raw.tokenMetadata?.sellTaxBps),
-    estimatedGasUnits: numOrNull(raw.gas),
-    ...(raw.to ? { to: String(raw.to) } : {}),
-    ...(raw.data ? { calldata: String(raw.data) } : {}),
-    ...(raw.value ? { value: String(raw.value) } : {}),
+    buyTaxBps: numOrNull(raw.tokenMetadata?.buyToken?.buyTaxBps),
+    sellTaxBps: numOrNull(raw.tokenMetadata?.sellToken?.sellTaxBps),
+    estimatedGasUnits: numOrNull(tx.gas ?? raw.gas),
+    ...(tx.to ?? raw.to ? { to: String(tx.to ?? raw.to) } : {}),
+    ...(tx.data ?? raw.data ? { calldata: String(tx.data ?? raw.data) } : {}),
+    ...(tx.value ?? raw.value ? { value: String(tx.value ?? raw.value) } : {}),
     raw,
   };
 }
@@ -77,7 +93,11 @@ async function fetchZeroExQuote(request: QuoteRequest): Promise<ZeroExQuoteRespo
     slippageBps: String(request.slippageBps),
   });
   const response = await fetch(`${ZEROEX_BASE}/quote?${params}`, {
-    headers: { accept: "application/json", "0x-api-key": apiKey() },
+    headers: {
+      accept: "application/json",
+      "0x-api-key": apiKey(),
+      "0x-version": "v2",
+    },
   });
   if (!response.ok) {
     throw new Error(`0x HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
@@ -86,9 +106,10 @@ async function fetchZeroExQuote(request: QuoteRequest): Promise<ZeroExQuoteRespo
 }
 
 /**
- * 0x Swap API adapter (primary EVM quoter). UNVERIFIED live: endpoint shape
- * follows the public 0x v1 docs but no keyed call has been made from this
- * codebase yet — confirm against a real quote before Stage 1.
+ * 0x Swap API v2 adapter (primary EVM quoter; supports all our EVM chains
+ * including Robinhood 4663). UNVERIFIED live: shape follows the public v2
+ * docs but no keyed call has been made from this codebase yet — confirm
+ * against a real quote once ZEROEX_API_KEY is set.
  */
 export class ZeroExExecutor implements SwapExecutor {
   readonly name = "0x";

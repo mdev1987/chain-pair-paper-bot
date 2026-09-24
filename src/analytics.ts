@@ -108,6 +108,13 @@ export interface TradeRecord {
   modeledFeeUsd: number;
   /** Shadow modeled slippage component (research only, never cash). */
   modeledSlipUsd: number;
+  /**
+   * True when the exit quote diagnostic found a drained pool (no active
+   * liquidity), i.e. the paper fill may overstate an unexitable exit.
+   * NULL = unknown (closed before the flag existed and unmatched by the
+   * boot backfill); FALSE = exit quoted against live liquidity.
+   */
+  drainedExit: boolean | null;
 }
 
 const FILLS_DDL = `CREATE TABLE IF NOT EXISTS fills (
@@ -147,7 +154,7 @@ const TRADES_DDL = `CREATE TABLE IF NOT EXISTS trades (
   net_pnl_usd DOUBLE, cost_model VARCHAR, mfe_pct DOUBLE, mae_pct DOUBLE,
   exit_pct DOUBLE, giveback_pp DOUBLE, time_to_mfe_s BIGINT,
   time_to_mae_s BIGINT, exit_trigger_pct DOUBLE, gap_through_stop BOOLEAN,
-  modeled_fee_usd DOUBLE, modeled_slip_usd DOUBLE
+  modeled_fee_usd DOUBLE, modeled_slip_usd DOUBLE, drained_exit BOOLEAN
 )`;
 
 // Columns added after the initial schema. Applied idempotently on every
@@ -167,6 +174,7 @@ const TRADES_MIGRATION_COLUMNS = [
   "gap_through_stop BOOLEAN",
   "modeled_fee_usd DOUBLE",
   "modeled_slip_usd DOUBLE",
+  "drained_exit BOOLEAN",
 ];
 
 /**
@@ -206,6 +214,17 @@ async function openConnection(dbPath: string): Promise<DuckDBConnection> {
   for (const column of TRADES_MIGRATION_COLUMNS) {
     const name = column.split(" ")[0]!;
     await connection.run(`ALTER TABLE trades ADD COLUMN IF NOT EXISTS ${name} ${column.slice(name.length + 1)}`);
+  }
+  // Idempotent backfill: exits whose quote diagnostic reported a drained
+  // pool predate the drained_exit column.
+  try {
+    await connection.run(
+      `UPDATE trades SET drained_exit = TRUE WHERE drained_exit IS NOT TRUE
+       AND position_id IN (SELECT position_id FROM quote_checks WHERE side = 'SELL'
+       AND (note ILIKE '%no active liquidity%' OR note ILIKE '%uninitialized%'))`,
+    );
+  } catch {
+    // Best-effort: fresh ledgers simply have no matching rows.
   }
   return connection;
 }
@@ -334,8 +353,8 @@ export async function recordTrade(trade: TradeRecord): Promise<void> {
         entry_liquidity_usd, exit_liquidity_usd, entry_age_s,
         net_pnl_usd, cost_model, mfe_pct, mae_pct, exit_pct, giveback_pp,
         time_to_mfe_s, time_to_mae_s, exit_trigger_pct, gap_through_stop,
-        modeled_fee_usd, modeled_slip_usd)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39)`,
+        modeled_fee_usd, modeled_slip_usd, drained_exit)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40)`,
       [
         trade.positionId, trade.chain, trade.dex, trade.symbol,
         trade.tokenName, trade.pair, trade.pool, trade.ca, trade.quote,
@@ -347,13 +366,24 @@ export async function recordTrade(trade: TradeRecord): Promise<void> {
         trade.netPnlUsd, trade.costModel, trade.mfePct, trade.maePct,
         trade.exitPct, trade.givebackPp, trade.timeToMfeS, trade.timeToMaeS,
         trade.exitTriggerPct, trade.gapThroughStop,
-        trade.modeledFeeUsd, trade.modeledSlipUsd,
+        trade.modeledFeeUsd, trade.modeledSlipUsd, trade.drainedExit,
       ],
     );
   } catch (error) {
     failure = String(error);
     conn = null;
     initPromise = null;
+  }
+}
+
+/** Flag a closed trade whose exit diagnostic found a drained pool. Best-effort. */
+export async function markTradeDrained(positionId: string): Promise<void> {
+  const c = await ensure();
+  if (!c) return;
+  try {
+    await c.run(`UPDATE trades SET drained_exit = TRUE WHERE position_id = $1`, [positionId]);
+  } catch {
+    // Best-effort: the quote_checks note remains the source of truth.
   }
 }
 
@@ -445,5 +475,8 @@ export function tradeRecordFromPosition(
     gapThroughStop: exitTriggerPct - exitPct > GAP_TOLERANCE_PP,
     modeledFeeUsd: position.shadowFeeUsd,
     modeledSlipUsd: position.shadowSlipUsd,
+    // Default at insert; the post-exit quote diagnostic flips it via
+    // markTradeDrained when the pool turns out drained.
+    drainedExit: false,
   };
 }

@@ -85,12 +85,23 @@ export function quoteAdaptersFor(chain: string, pairAddress?: string): QuoteAdap
  * Why the direct-V2 adapter was omitted for this pairAddress, or null when
  * it was included / no pair was supplied. Pure — no network. Exists so
  * quote_checks notes say "uniswap: not-v2-pair (len=66)" instead of a
- * silent adapter drop that looks like a routing bug.
+ * silent adapter drop that looks like a routing bug. (V4 poolIds get their
+ * own adapter, so callers only append this when NEITHER direct adapter is
+ * present.)
  */
 export function directV2SkipReason(pairAddress?: string): string | null {
   if (!pairAddress) return null;
   if (/^0x[0-9a-fA-F]{40}$/.test(pairAddress)) return null;
   return `uniswap: not-v2-pair (len=${pairAddress.length})`;
+}
+
+/**
+ * True when a quote-check note reports a drained/uninitialized pool, i.e.
+ * the paper fill may overstate an exit that was unfillable on-chain.
+ * Pure — tested, and reused by the drained-exit ledger flag.
+ */
+export function quoteNoteIndicatesDrained(note: string): boolean {
+  return /no active liquidity|pool uninitialized|empty slot0/i.test(note);
 }
 
 export interface SimCheckInput {

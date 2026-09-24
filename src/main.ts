@@ -20,6 +20,7 @@ import {
   analyticsStatus,
   closeAnalytics,
   initAnalytics,
+  markTradeDrained,
   recordFill,
   recordQuoteCheck,
   recordSnapshot,
@@ -40,6 +41,7 @@ import { telegram, testTelegram } from "./telegram.ts";
 import {
   KNOWN_QUOTE_DECIMALS,
   qtyToBaseUnits,
+  quoteNoteIndicatesDrained,
   quotePriceUsd,
   resolveTokenDecimals,
   SIM_ZERO_TAKER,
@@ -288,7 +290,7 @@ async function recordExitQuoteCheck(
   pair: DexScreenerPair,
   soldQty: number,
   exitPrice: number,
-): Promise<void> {
+): Promise<{ source: string; note: string } | null> {
   const base = {
     time: Date.now(),
     positionId: position.id,
@@ -300,12 +302,13 @@ async function recordExitQuoteCheck(
     const tokenDec = await resolveTokenDecimals(position.chain, position.tokenAddress);
     const qd = KNOWN_QUOTE_DECIMALS[position.quoteSymbol.toLowerCase()];
     if (tokenDec === null) {
+      const note = "token-decimals-unavailable";
       await recordQuoteCheck({
         ...base, source: "skipped", quotedSellAmount: "", quotedBuyAmount: "",
         sellDecimals: null, buyDecimals: qd ?? null, riskPass: null, simOk: null,
-        note: "token-decimals-unavailable",
+        note,
       });
-      return;
+      return { source: "skipped", note };
     }
     const chainId = chainIdFor(position.chain);
     const result = await simulateSwap({
@@ -327,8 +330,10 @@ async function recordExitQuoteCheck(
       sellDecimals: tokenDec, buyDecimals: qd ?? null,
       riskPass: result.riskPass, simOk: result.simOk, note: result.note,
     });
+    return { source: result.source, note: result.note };
   } catch (error) {
     log(`⚠️ exit quote-check ${position.id}: ${String(error).slice(0, 150)}`);
+    return null;
   }
 }
 
@@ -689,7 +694,12 @@ async function trackPositions(): Promise<void> {
                 balanceAfterUsd: position.balanceAfterUsd,
               }));
               // Parallel real-quote diagnostic for the actual exit fill.
-              await recordExitQuoteCheck(position, pair, event.soldQty, event.price);
+              const exitCheck = await recordExitQuoteCheck(position, pair, event.soldQty, event.price);
+              // A drained pool means the paper fill may overstate an exit
+              // that was unfillable on-chain — flag it for expectancy math.
+              if (exitCheck && quoteNoteIndicatesDrained(exitCheck.note)) {
+                await markTradeDrained(position.id);
+              }
               const snapshot = portfolio.snapshot(positions.values());
               const chainStat = portfolio.chainStat(position.chain);
               const tokenStat = portfolio.tokenPnlUsd(position.chain, position.symbol);
@@ -780,6 +790,12 @@ async function main(): Promise<void> {
   console.log(`Max positions       : ${config.entry.maxOpenPositions}`);
   console.log(`Telegram            : ${config.telegram.enabled}`);
   console.log(`CoinGecko key       : ${config.coingecko.apiKey ? "present (enrichment only)" : "absent"}`);
+  // Quote-layer visibility: without a 0x key every EVM quote-check runs
+  // aggregator-free (direct V2/V4 only). Without a Jupiter key, Solana
+  // still quotes (Ultra is keyless) — the key only raises rate limits.
+  console.log(`0x key              : ${process.env.ZEROEX_API_KEY ? "present (EVM aggregator quotes on)" : "absent (direct-V2/V4 quotes only)"}`);
+  console.log(`Jupiter key         : ${process.env.JUPITER_API_KEY ? "present" : "absent (Ultra quotes still work, lower rate limit)"}`);
+  console.log(`Live trading        : ${process.env.LIVE_TRADING_ENABLED === "true" ? "ENABLED — real funds at risk" : "off (paper only)"}`);
   console.log(`Recovery            : ${config.recovery.enabled ? config.recovery.stateFile : "disabled"}`);
 
   const analyticsReady = await initAnalytics();

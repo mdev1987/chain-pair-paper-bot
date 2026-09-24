@@ -139,27 +139,30 @@ describe("quote mappings", () => {
     );
   });
 
-  test("0x maps amounts, gas, calldata and taxes", () => {
+  test("0x v2 maps amounts, gas, calldata and taxes", () => {
     const quote = mapZeroExQuote("bsc", { ...REQ, chain: "bsc", chainId: 56 }, {
+      liquidityAvailable: true,
       sellToken: "S",
       buyToken: "B",
       sellAmount: "1000",
       buyAmount: "950",
-      gas: "200000",
-      to: "0xrouter",
-      data: "0xabc",
-      value: "0",
-      tokenMetadata: { buyTaxBps: "100", sellTaxBps: 0 },
+      transaction: { to: "0xrouter", data: "0xabc", gas: "200000", value: "0" },
+      tokenMetadata: { buyToken: { buyTaxBps: "100" }, sellToken: { sellTaxBps: 0 } },
     });
     assert.equal(quote.source, "0x");
     assert.equal(quote.buyAmount, "950");
     assert.equal(quote.to, "0xrouter");
     assert.equal(quote.calldata, "0xabc");
     assert.equal(quote.buyTaxBps, 100);
+    assert.equal(quote.sellTaxBps, 0);
     assert.equal(quote.priceImpactPct, null);
   });
 
-  test("0x rejects missing amounts (unindexed token)", () => {
+  test("0x rejects illiquid pairs and missing amounts (unindexed token)", () => {
+    assert.throws(
+      () => mapZeroExQuote("bsc", REQ, { liquidityAvailable: false }),
+      /no liquidity available/,
+    );
     assert.throws(() => mapZeroExQuote("bsc", REQ, {}), /unindexed/);
   });
 
