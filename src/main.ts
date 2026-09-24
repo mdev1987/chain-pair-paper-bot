@@ -616,6 +616,9 @@ async function trackPositions(): Promise<void> {
                 detail: `TP${event.level}`,
                 balanceAfterUsd: portfolio.cashUsd,
               });
+              // Parallel real-quote diagnostic for the partial exit fill,
+              // same as full exits below. Best-effort: never gates trading.
+              await recordExitQuoteCheck(position, pair, event.soldQty, event.price);
               if (config.telegram.announceUpdates) {
                 await notify(buildTpMessage({
                   position,

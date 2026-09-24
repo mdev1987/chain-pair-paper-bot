@@ -3,6 +3,7 @@ import { assessQuoteRisk } from "./risk.ts";
 import { routeQuote, type QuoteAdapter } from "./evm/router.ts";
 import { ZeroExExecutor } from "./evm/zeroex.ts";
 import { UniswapV2DirectExecutor } from "./evm/uniswap.ts";
+import { UniswapV4DirectExecutor } from "./evm/v4.ts";
 import { JupiterExecutor } from "./solana/jupiter.ts";
 import { EVM_CHAIN_IDS, getEvmPublicClient, getEvmTokenDecimals } from "./evm/viem-client.ts";
 import { getSolanaTokenDecimals } from "./solana/helius.ts";
@@ -68,12 +69,13 @@ export function quoteAdaptersFor(chain: string, pairAddress?: string): QuoteAdap
   if (EVM_CHAIN_IDS[chain] === undefined) return [];
   const adapters: QuoteAdapter[] = [new ZeroExExecutor()];
   if (pairAddress) {
-    try {
+    // V2 pair contract (40 hex) vs V4 poolId (64 hex): different quoters.
+    // Anything else is aggregator-only; diagnosed via directSkipReason so
+    // quote_checks notes can explain the omission.
+    if (/^0x[0-9a-fA-F]{40}$/.test(pairAddress)) {
       adapters.push(new UniswapV2DirectExecutor(pairAddress));
-    } catch {
-      // Invalid pair address (e.g. Uniswap V4 pool id = 64 hex, not a V2
-      // pair contract): aggregator-only routing. Diagnosed by callers via
-      // directV2SkipReason so quote_checks notes can explain the omission.
+    } else if (/^0x[0-9a-fA-F]{64}$/.test(pairAddress)) {
+      adapters.push(new UniswapV4DirectExecutor(pairAddress));
     }
   }
   return adapters;
@@ -132,7 +134,9 @@ function skipped(note: string): SimCheckResult {
 export async function simulateSwap(input: SimCheckInput): Promise<SimCheckResult> {
   const adapters = quoteAdaptersFor(input.chain, input.pairAddress);
   if (adapters.length === 0) return skipped(`unsupported-chain ${input.chain}`);
-  const v2Skip = directV2SkipReason(input.pairAddress);
+  // Only explain the missing direct adapter when neither V2 nor V4 was added.
+  const hasDirect = adapters.some((a) => a.name === "uniswap" || a.name === "uniswap-v4");
+  const v2Skip = hasDirect ? null : directV2SkipReason(input.pairAddress);
 
   const request: QuoteRequest = {
     chain: input.chain,

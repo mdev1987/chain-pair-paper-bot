@@ -10,6 +10,13 @@ import {
   V2_ROUTERS,
   v2RouterFor,
 } from "../src/execution/evm/uniswap.ts";
+import {
+  quoteV4AmountOut,
+  UniswapV4DirectExecutor,
+  V4_STATE_VIEWS,
+  v4StateViewFor,
+  v4SwapFeePips,
+} from "../src/execution/evm/v4.ts";
 import { routeQuote, type QuoteAdapter } from "../src/execution/evm/router.ts";
 import { PaperExecutor } from "../src/execution/paper.ts";
 import { buildDrpcUrl, buildInfuraUrl } from "../src/execution/evm/viem-client.ts";
@@ -300,5 +307,75 @@ describe("RPC sources", () => {
     assert.equal(buildDrpcUrl("base", "k"), null);
     assert.equal(buildDrpcUrl("bsc", ""), null);
     assert.equal(buildDrpcUrl("bsc", undefined), null);
+  });
+});
+
+describe("uniswap V4 direct quoter", () => {
+  const Q96 = 2n ** 96n;
+
+  test("swap fee follows ProtocolFeeLibrary exactly", () => {
+    assert.equal(v4SwapFeePips(0n, 3000n, true), 3000n);
+    assert.equal(v4SwapFeePips(0n, 3000n, false), 3000n);
+    // familiars live slot0: packed 4097000 = 0x3e83e8, lp 10000.
+    // oneForZero proto = 4097000 >> 12 = 1000 → 1000+10000-10 = 10990.
+    assert.equal(v4SwapFeePips(4097000n, 10000n, false), 10990n);
+    // zeroForOne proto = 4097000 & 0xfff = 0x3e8 = 1000 → same 10990.
+    assert.equal(v4SwapFeePips(4097000n, 10000n, true), 10990n);
+  });
+
+  test("single-tick constant-price math matches hand computation", () => {
+    // Price 1 (sqrtP = 2^96), 6/6 decimals, fee 3000: out = in * 0.997.
+    assert.equal(quoteV4AmountOut(1_000_000n, Q96, true, 3000n, 6, 6), 997000n);
+    assert.equal(quoteV4AmountOut(1_000_000n, Q96, false, 3000n, 6, 6), 997000n);
+    // Price 4 token1/token0 (sqrtP = 2^97), 18/18, fee 3000, zeroForOne:
+    // 1e18 * 4 * 0.997 = 3.988e18.
+    assert.equal(
+      quoteV4AmountOut(10n ** 18n, 2n ** 97n, true, 3000n, 18, 18),
+      3988000000000000000n,
+    );
+    // OneForZero is the mirror: 3.988e18 token1 → ~0.994009 token0.
+    assert.equal(
+      quoteV4AmountOut(3988000000000000000n, 2n ** 97n, false, 3000n, 18, 18),
+      994009000000000000n,
+    );
+    // Decimal rescale: 6-decimal in, 18-decimal out at price 1, no fee.
+    assert.equal(quoteV4AmountOut(1_000_000n, Q96, true, 0n, 6, 18), 10n ** 18n);
+    // Degenerate inputs quote zero.
+    assert.equal(quoteV4AmountOut(0n, Q96, true, 3000n, 6, 6), 0n);
+    assert.equal(quoteV4AmountOut(1000n, 0n, true, 3000n, 6, 6), 0n);
+    assert.equal(quoteV4AmountOut(1000n, Q96, true, 1_000_000n, 6, 6), 0n);
+  });
+
+  test("V4 executor validates its pool id", () => {
+    assert.throws(() => new UniswapV4DirectExecutor("not-an-id"), /Invalid V4 pool id/);
+    assert.throws(
+      () => new UniswapV4DirectExecutor("0x0000000000000000000000000000000000000001"),
+      /Invalid V4 pool id/,
+    );
+    const executor = new UniswapV4DirectExecutor(
+      "0xdb9cc66942610b8d434aff2c8df97a1d42e44dbcbc1b7065d215db1f1bd2f04c",
+    );
+    assert.equal(executor.name, "uniswap-v4");
+  });
+
+  test("V4 StateViews are valid addresses with robinhood present", async () => {
+    const { isAddress } = await import("viem");
+    for (const [chain, addr] of Object.entries(V4_STATE_VIEWS)) {
+      assert.equal(isAddress(addr), true, `${chain} invalid: ${addr}`);
+      assert.equal(addr.length, 42, `${chain} must be 0x + 40 hex`);
+    }
+    assert.equal(
+      V4_STATE_VIEWS.robinhood,
+      "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
+      "StateView Robinhood (official deployments doc, verified live)",
+    );
+    assert.equal(v4StateViewFor("robinhood"), V4_STATE_VIEWS.robinhood);
+    const prevEnv = process.env.UNISWAP_V4_STATEVIEWS;
+    delete process.env.UNISWAP_V4_STATEVIEWS;
+    try {
+      assert.throws(() => v4StateViewFor("missing-chain"), /No V4 StateView configured/);
+    } finally {
+      if (prevEnv !== undefined) process.env.UNISWAP_V4_STATEVIEWS = prevEnv;
+    }
   });
 });

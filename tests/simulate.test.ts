@@ -48,9 +48,12 @@ describe("simulation helpers", () => {
     assert.deepEqual(quoteAdaptersFor("unknown-chain"), []);
   });
 
-  test("V4 pool ids (64-hex) drop direct-V2 and leave a skip diagnostic", () => {
+  test("V4 pool ids (64-hex) get the direct-V4 adapter, garbage stays aggregator-only", () => {
     const v4 = "0xdb9cc66942610b8d434aff2c8df97a1d42e44dbcbc1b7065d215db1f1bd2f04c";
-    assert.deepEqual(quoteAdaptersFor("robinhood", v4).map((a) => a.name), ["0x"]);
+    assert.deepEqual(
+      quoteAdaptersFor("robinhood", v4).map((a) => a.name),
+      ["0x", "uniswap-v4"],
+    );
     assert.equal(directV2SkipReason(v4), "uniswap: not-v2-pair (len=66)");
     assert.equal(
       directV2SkipReason("0x0000000000000000000000000000000000000001"),
