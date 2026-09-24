@@ -6,7 +6,7 @@
   "scripts": {
     "start": "bun run src/main.ts",
     "check": "bunx tsc --noEmit",
-    "test": "bun test tests/"
+    "test": "bun test --env-file=.env.test tests/"
   },
   "dependencies": {
     "@duckdb/node-api": "^1.5.5-r.5",

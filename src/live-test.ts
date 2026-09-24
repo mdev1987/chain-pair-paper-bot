@@ -154,6 +154,7 @@ async function runBuyLeg(
     tokenMint: fill.buyMint,
     filledBaseUnits: fill.buyAmountBaseUnits,
     entryCostUsd: TEST_SIZE_USD,
+    quoteMint: SOL_MINT,
   });
   saveLivePositions(mirror);
   journal = markConfirmed(journal, TEST_ID, "BUY");
@@ -248,6 +249,7 @@ async function resumeLeg(
         tokenMint: fill.buyMint,
         filledBaseUnits: fill.buyAmountBaseUnits,
         entryCostUsd: TEST_SIZE_USD,
+        quoteMint: SOL_MINT,
       });
       saveLivePositions(mirror);
     } else {

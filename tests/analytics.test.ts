@@ -18,6 +18,7 @@ import {
   totalPnlUsd,
   updatePosition,
 } from "../src/position.ts";
+import { config } from "../src/config.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "paperbot-duckdb-"));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -174,13 +175,17 @@ describe("trade path record", () => {
 
     // Shadow (100 bps + 1% per side): entry $100 → $2.00; TP1 25u @1.3 →
     // $0.65; exit 75u @0.9 → $1.35. Gross is flat (7.5 - 7.5), net is -$4.
+    // (Assumes default PAPER_*_FEE/SLIPPAGE_BPS=0 and TP1 30%/25%.)
     assert.equal(record.costModel, "NET_PNL_100BPS_1PCT");
     assert.ok(Math.abs(totalPnlUsd(position) - 0) < 1e-9);
     assert.ok(Math.abs(record.netPnlUsd - -4) < 1e-9);
-    // Trail trigger was 1.105 (+10.5%, high 1.3 × 0.85 at 15% distance)
-    // but the fill printed at 0.9 (-10%): a gap-through-stop with the
-    // modeled cost split stored separately.
-    assert.ok(Math.abs(record.exitTriggerPct - 10.5) < 1e-9);
+    // Trail trigger derives from live config (default 15% distance:
+    // 1.105, +10.5% off high 1.3) so this test stays hermetic under any
+    // TRAIL_DISTANCE_PCT env. The fill printed at 0.9 (-10%): a
+    // gap-through-stop with the modeled cost split stored separately.
+    const trailTrigger = 1.3 * (1 - config.stops.trailDistancePct / 100);
+    const trailTriggerPct = (trailTrigger / 1 - 1) * 100;
+    assert.ok(Math.abs(record.exitTriggerPct - trailTriggerPct) < 1e-9);
     assert.equal(record.gapThroughStop, true);
     assert.ok(Math.abs(record.modeledFeeUsd - 2) < 1e-9);
     assert.ok(Math.abs(record.modeledSlipUsd - 2) < 1e-9);

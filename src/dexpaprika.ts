@@ -1,26 +1,6 @@
 import { DexPaprikaClient } from "dexpaprika-sdk";
 import { config } from "./config.ts";
-
-class SlidingWindowRateLimiter {
-  private readonly timestamps: number[] = [];
-
-  constructor(private readonly maxPerMinute: number) {}
-
-  async acquire(): Promise<void> {
-    while (true) {
-      const now = Date.now();
-      const cutoff = now - 60_000;
-      while (this.timestamps.length > 0 && this.timestamps[0]! <= cutoff) {
-        this.timestamps.shift();
-      }
-      if (this.timestamps.length < this.maxPerMinute) {
-        this.timestamps.push(now);
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, Math.max(25, this.timestamps[0]! + 60_000 - now + 5)));
-    }
-  }
-}
+import { SlidingWindowRateLimiter } from "./rate-limiter.ts";
 
 const limiter = new SlidingWindowRateLimiter(config.dexPaprika.maxRpm);
 

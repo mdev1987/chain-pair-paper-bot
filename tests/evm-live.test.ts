@@ -5,13 +5,16 @@ import {
   isNativeToken,
   parseEvmFillFromReceipt,
   spenderFor,
+  traderEvmAddress,
 } from "../src/execution/evm/live.ts";
 import { evmFillFromReceipt } from "../src/execution/evm/reconcile.ts";
 import { UniswapV4DirectExecutor } from "../src/execution/evm/v4.ts";
 import { ZeroExExecutor } from "../src/execution/evm/zeroex.ts";
 import type { Quote } from "../src/execution/types.ts";
 
-const TRADER = "0xAaa6464ECFdE39490F6f98f7989857e47098289C";
+// Trader identity under test comes from the environment (pinned to a
+// throwaway key by .env.test) — never hardcode a live wallet here.
+const TRADER = traderEvmAddress();
 const TOKEN_A = "0x1111111111111111111111111111111111111111";
 const TOKEN_B = "0x2222222222222222222222222222222222222222";
 const OTHER = "0x3333333333333333333333333333333333333333";

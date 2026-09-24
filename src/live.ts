@@ -27,8 +27,8 @@ import {
   markConfirmed,
   markFailed,
   markSubmitted,
-  openOrders,
   recordSignal,
+  retrySignal,
   saveLiveOrders,
   type LiveOrder,
 } from "./execution/live-orders.ts";
@@ -119,30 +119,42 @@ async function buyDecimalsFor(chain: string, mint: string, symbol: string): Prom
   return KNOWN_QUOTE_DECIMALS[symbol.toLowerCase()] ?? null;
 }
 
-function saveAll(): void {
+function saveAll(log: (message: string) => void): void {
   try {
     saveLiveOrders(journal);
   } catch (error) {
-    console.log(`⚠️ live journal persist failed: ${String(error).slice(0, 120)}`);
+    log(`⚠️ live journal persist failed: ${String(error).slice(0, 120)}`);
   }
   try {
     saveLivePositions(mirror);
   } catch (error) {
-    console.log(`⚠️ live mirror persist failed: ${String(error).slice(0, 120)}`);
+    log(`⚠️ live mirror persist failed: ${String(error).slice(0, 120)}`);
   }
   try {
     persistLiveState();
   } catch (error) {
-    console.log(`⚠️ live state persist failed: ${String(error).slice(0, 120)}`);
+    log(`⚠️ live state persist failed: ${String(error).slice(0, 120)}`);
   }
 }
 
 function syncCounts(): void {
   liveState.setLiveOpenCount(countOpenLive(mirror));
-}
-
-function hasOpenOrder(positionId: string): boolean {
-  return openOrders(journal).some((o) => o.positionId === positionId);
+  // Open cost basis for the stuck-bag halt bound (assumes open bags go to
+  // zero). Pro-rata by remaining fill so partial TPs release exposure.
+  let exposure = 0;
+  for (const p of mirror) {
+    if (p.status !== "OPEN") continue;
+    try {
+      const remaining = BigInt(p.remainingBaseUnits);
+      const filled = BigInt(p.filledBaseUnits);
+      if (filled > 0n && remaining >= 0n) {
+        exposure += p.entryCostUsd * Number(remaining) / Number(filled);
+      }
+    } catch {
+      exposure += p.entryCostUsd;
+    }
+  }
+  liveState.setLiveOpenExposureUsd(exposure);
 }
 
 function trackPending(positionId: string, add: boolean): void {
@@ -155,9 +167,10 @@ function failOrder(
   positionId: string,
   side: "BUY" | "SELL",
   note: string,
+  label = "",
 ): void {
   try {
-    journal = markFailed(journal, positionId, side, note);
+    journal = markFailed(journal, positionId, side, note, label);
     saveLiveOrders(journal);
   } catch (error) {
     deps.log(`⚠️ live ${side} ${positionId}: journal markFailed failed (${String(error).slice(0, 100)}) — ${note}`);
@@ -178,8 +191,20 @@ function quoteUsd(
   return { qp, qd };
 }
 
+export interface LiveFillInfo {
+  id: string;
+  chain: string;
+  dexId: string;
+  symbol: string;
+  tokenName: string;
+  pairAddress: string;
+  poolAddress?: string;
+  tokenAddress: string;
+  quoteSymbol: string;
+}
+
 function liveFillRow(
-  position: Position,
+  position: LiveFillInfo,
   detail: "LIVE_OPEN" | `LIVE_TP${number}` | "LIVE_EXIT",
   price: number,
   qty: number,
@@ -273,6 +298,9 @@ export async function initLive(
               tokenMint: fill.buyMint,
               filledBaseUnits: fill.buyAmountBaseUnits,
               entryCostUsd: paper.initialUsdSize,
+              // EVM BUY orders journal the quote as meta.sellToken — the
+              // sweeper needs it after paper is gone.
+              ...(order.meta?.sellToken ? { quoteMint: order.meta.sellToken } : {}),
             });
           }
         } else {
@@ -300,7 +328,61 @@ export async function initLive(
         report.discrepancies.push(`${order.positionId}: boot-apply failed: ${String(error).slice(0, 120)}`);
       }
     }
-    saveAll();
+    // Catch-up: paper TPs that booked while live was down. tpHit set + live
+    // OPEN + no CONFIRMED labeled order means the live leg never ran —
+    // re-queue it with recomputed qty instead of losing the fill.
+    for (const paper of paperPositions.values()) {
+      if (paper.status !== "OPEN") continue;
+      const live = mirror.find((p) => p.positionId === paper.id && p.status === "OPEN");
+      if (!live) continue;
+      const tpLevels = paper.exitProfile?.tp ?? config.tp;
+      tpLevels.forEach((level, i) => {
+        if (!paper.tpHit[i]) return;
+        const label = `TP${i + 1}`;
+        const done = journal.some(
+          (o) => o.positionId === paper.id && o.side === "SELL" && (o.label ?? "") === label && o.status === "CONFIRMED",
+        );
+        if (done) return;
+        let qty: bigint;
+        try {
+          qty = liveTpQty(live.originalBaseUnits, level.sellPct);
+          const remaining = BigInt(live.remainingBaseUnits);
+          if (qty > remaining) qty = remaining;
+        } catch {
+          return;
+        }
+        if (qty <= 0n) return;
+        if (!live.quoteMint) {
+          report.discrepancies.push(`${paper.id}: catch-up ${label} without quote U (manual review)`);
+          return;
+        }
+        const res = enqueueLiveSell(pendingSells, {
+          positionId: paper.id,
+          chain: paper.chain,
+          symbol: paper.symbol,
+          tokenName: paper.tokenName,
+          dexId: paper.dexId,
+          pairAddress: paper.pairAddress,
+          poolAddress: paper.poolAddress ?? "",
+          tokenMint: paper.tokenAddress,
+          quoteMint: live.quoteMint,
+          quoteSymbol: paper.quoteSymbol,
+          priceNative: "",
+          kind: "TP",
+          level: (i + 1) as 1 | 2 | 3,
+          label,
+          sellBaseUnits: qty.toString(),
+          paperPrice: paper.currentPrice,
+          sizeUsdForReport: 0,
+        });
+        pendingSells = res.queue;
+        if (res.enqueued) {
+          trackPending(paper.id, true);
+          report.discrepancies.push(`${paper.id}: catch-up ${label} re-queued at boot`);
+        }
+      });
+    }
+    saveAll(deps.log);
     syncCounts();
     const lines = [
       `🔄 live reconcile: ${report.confirmed.length} confirmed, ${report.failed.length} failed, ${report.stillMissing.length} still missing`,
@@ -342,15 +424,17 @@ export async function maybeLiveEnter(
     saveLiveOrders(journal);
     trackPending(id, true);
     const trader = takerFor(position.chain);
+    // Live-only slippage budget (config.live), NEVER the paper friction:
+    // PAPER_SLIPPAGE_BPS=0 would request zero tolerance and fail the swap.
     const quote = await quoter.quoteBuy(liveQuoteRequest(position.chain, {
       sellToken: quoteSellToken,
       buyToken: position.tokenAddress,
       sellAmountBaseUnits: sellBase,
-      slippageBps: config.entry.slippageBps,
+      slippageBps: config.live.buySlippageBps,
     }));
     const res = await (evm
-      ? zeroex.buy({ quote, taker: trader, slippageBps: config.entry.slippageBps, sizeUsd, positionId: id })
-      : jupiter.buy({ quote, taker: trader, slippageBps: config.entry.slippageBps, sizeUsd, positionId: id }));
+      ? zeroex.buy({ quote, taker: trader, slippageBps: config.live.buySlippageBps, sizeUsd, positionId: id })
+      : jupiter.buy({ quote, taker: trader, slippageBps: config.live.buySlippageBps, sizeUsd, positionId: id }));
     if (!res.hash) throw new Error("live buy returned no signature");
     journal = markSubmitted(journal, id, "BUY", res.hash);
     saveLiveOrders(journal);
@@ -372,6 +456,7 @@ export async function maybeLiveEnter(
       tokenMint: fill.buyMint,
       filledBaseUnits: fill.buyAmountBaseUnits,
       entryCostUsd: sizeUsd,
+      quoteMint: pair.quoteToken.address,
     });
     saveLivePositions(mirror);
     journal = markConfirmed(journal, id, "BUY");
@@ -399,51 +484,188 @@ interface LiveSellEvent {
   proceedsUsd: number;
 }
 
-async function liveSellFlow(
-  deps: LiveDeps,
-  position: Position,
-  pair: DexScreenerPair,
-  sellBaseUnits: bigint,
-  detail: "TP" | "EXIT",
-  level: number | undefined,
-  paperPrice: number,
-  sizeUsdForReport: number,
-): Promise<void> {
-  const id = position.id;
-  const evm = isEvmChain(position.chain);
-  const quoter = evm ? zeroex : jupiter;
-  const live = mirror.find((p) => p.positionId === id && p.status === "OPEN");
-  if (!live) {
-    deps.log(`⚠️ live sell ${id}: no open live position (paper-only or never filled live)`);
-    return;
+// ---------------------------------------------------------------------------
+// Live exit manager: paper TP/exit events enqueue intent; a background pump
+// (2s loop, 2 concurrent) executes with escalating slippage and retries.
+// Nothing here ever runs on the price-tracker tick, so a stuck sell or a
+// 120s receipt wait can no longer blind other positions' stops.
+// A failed sell retries (x1/x2/x5 slippage) up to LIVE_SELL_MAX_RETRIES,
+// then goes manual-review terminal. A 60s sweeper reaps live bags whose
+// paper position is gone.
+// ---------------------------------------------------------------------------
+
+export interface PendingLiveSell {
+  positionId: string;
+  chain: string;
+  symbol: string;
+  tokenName: string;
+  dexId: string;
+  pairAddress: string;
+  poolAddress: string;
+  tokenMint: string;
+  quoteMint: string;
+  quoteSymbol: string;
+  priceNative: string;
+  kind: "TP" | "EXIT";
+  level?: number;
+  /** Journal label: TP1..TP3 or EXIT (one lifecycle each). */
+  label: string;
+  sellBaseUnits: string;
+  /** Mark price for USD reporting; NaN when unknown (sweeper orphans). */
+  paperPrice: number;
+  sizeUsdForReport: number;
+  attempts: number;
+  nextAttemptAt: number;
+}
+
+let pendingSells: PendingLiveSell[] = [];
+let lastSweepAt = 0;
+let pumping = false;
+const SELL_PUMP_CONCURRENCY = 2;
+const SELL_SWEEP_MS = 60_000;
+// Escalating slippage multipliers per attempt (0-based), capped at 5000bps.
+const SELL_SLIPPAGE_STEPS = [1, 2, 5];
+const sweepAlerted = new Set<string>();
+
+/** Pure: slippage budget for attempt N. Exported for tests. */
+export function nextSellSlippageBps(baseBps: number, attempt: number): number {
+  const step = SELL_SLIPPAGE_STEPS[Math.min(Math.max(0, attempt), SELL_SLIPPAGE_STEPS.length - 1)]!;
+  return Math.min(5000, baseBps * step);
+}
+
+/** Pure: backoff before the next attempt. Exported for tests. */
+export function sellRetryDelayMs(attempt: number): number {
+  return 5_000 * (attempt + 1);
+}
+
+/**
+ * Pure queue op: enqueue a live sell intent. Same (positionId, label) twice
+ * is one intent. An EXIT supersedes pending TPs for the position (paper
+ * already closed — partials are moot). Exported for tests.
+ */
+export function enqueueLiveSell(
+  queue: PendingLiveSell[],
+  item: Omit<PendingLiveSell, "attempts" | "nextAttemptAt">,
+  now = Date.now(),
+): { queue: PendingLiveSell[]; enqueued: boolean } {
+  if (queue.some((p) => p.positionId === item.positionId && p.label === item.label)) {
+    return { queue, enqueued: false };
   }
-  try {
+  const rest = item.kind === "EXIT"
+    ? queue.filter((p) => p.positionId !== item.positionId)
+    : queue;
+  return { queue: [...rest, { ...item, attempts: 0, nextAttemptAt: now }], enqueued: true };
+}
+
+function enqueue(item: Omit<PendingLiveSell, "attempts" | "nextAttemptAt">): boolean {
+  const res = enqueueLiveSell(pendingSells, item);
+  pendingSells = res.queue;
+  return res.enqueued;
+}
+
+function dequeue(positionId: string, label: string): void {
+  pendingSells = pendingSells.filter((p) => !(p.positionId === positionId && p.label === label));
+}
+
+/** Journal intent for a sell attempt: fresh SIGNAL, reopen FAILED, reuse SIGNAL. */
+function ensureSellSignal(item: PendingLiveSell, evm: boolean): void {
+  const existing = journal.find(
+    (o) => o.positionId === item.positionId && o.side === "SELL" && (o.label ?? "") === item.label,
+  );
+  if (!existing) {
     journal = recordSignal(journal, {
-      positionId: id,
-      chain: position.chain,
+      positionId: item.positionId,
+      chain: item.chain,
       side: "SELL",
+      label: item.label,
       ...(evm
-        ? { meta: { sellToken: position.tokenAddress, buyToken: pair.quoteToken.address, sellAmountBaseUnits: sellBaseUnits.toString() } }
+        ? { meta: { sellToken: item.tokenMint, buyToken: item.quoteMint, sellAmountBaseUnits: item.sellBaseUnits } }
         : {}),
     });
-    saveLiveOrders(journal);
-    trackPending(id, true);
-    const trader = takerFor(position.chain);
-    const quote = await quoter.quoteSell(liveQuoteRequest(position.chain, {
-      sellToken: position.tokenAddress,
-      buyToken: pair.quoteToken.address,
-      sellAmountBaseUnits: sellBaseUnits.toString(),
-      slippageBps: config.entry.slippageBps,
+  } else if (existing.status === "FAILED") {
+    journal = retrySignal(journal, item.positionId, "SELL", item.label, "retry after terminal fail");
+  } else if (existing.status !== "SIGNAL") {
+    throw new Error(`live sell ${item.label} ${item.positionId} already ${existing.status}`);
+  }
+  saveLiveOrders(journal);
+}
+
+function liveFillInfo(item: PendingLiveSell): {
+  id: string; chain: string; dexId: string; symbol: string; tokenName: string;
+  pairAddress: string; poolAddress: string; tokenAddress: string; quoteSymbol: string;
+} {
+  return {
+    id: item.positionId,
+    chain: item.chain,
+    dexId: item.dexId,
+    symbol: item.symbol,
+    tokenName: item.tokenName,
+    pairAddress: item.pairAddress,
+    poolAddress: item.poolAddress,
+    tokenAddress: item.tokenMint,
+    quoteSymbol: item.quoteSymbol,
+  };
+}
+
+/** Execute one queued sell (quote → submit → confirm → books). Never throws. */
+async function executePendingSell(deps: LiveDeps, item: PendingLiveSell): Promise<void> {
+  const evm = isEvmChain(item.chain);
+  const quoter = evm ? zeroex : jupiter;
+  const live = mirror.find((p) => p.positionId === item.positionId && p.status === "OPEN");
+  if (!live) {
+    deps.log(`⚠️ live sell ${item.label} ${item.positionId}: no open live position (dropped)`);
+    dequeue(item.positionId, item.label);
+    trackPending(item.positionId, false);
+    return;
+  }
+  // Re-cap to the live remainder: entry drag and earlier fills move it.
+  let qty: bigint;
+  try {
+    qty = BigInt(item.sellBaseUnits);
+    const remaining = BigInt(live.remainingBaseUnits);
+    if (qty > remaining) qty = remaining;
+  } catch {
+    deps.log(`⚠️ live sell ${item.label} ${item.positionId}: unreadable quantity (dropped)`);
+    dequeue(item.positionId, item.label);
+    trackPending(item.positionId, false);
+    return;
+  }
+  if (qty <= 0n) {
+    deps.log(`⚠️ live sell ${item.label} ${item.positionId}: nothing left to sell live (dropped)`);
+    dequeue(item.positionId, item.label);
+    trackPending(item.positionId, false);
+    return;
+  }
+  const slippageBps = nextSellSlippageBps(config.live.sellSlippageBps, item.attempts);
+  const fail = async (note: string, retryable: boolean): Promise<void> => {
+    if (retryable && item.attempts < config.live.sellMaxRetries) {
+      item.attempts += 1;
+      item.nextAttemptAt = Date.now() + sellRetryDelayMs(item.attempts);
+      deps.log(`⚠️ live sell ${item.label} ${item.positionId} attempt ${item.attempts} failed (${note}) — retry in ${sellRetryDelayMs(item.attempts) / 1000}s @ ${nextSellSlippageBps(config.live.sellSlippageBps, item.attempts)}bps`);
+      return;
+    }
+    dequeue(item.positionId, item.label);
+    failOrder(deps, item.positionId, "SELL", `${item.label}: ${note} (after ${item.attempts} retries)`, item.label);
+    await deps.notify(`🔴 LIVE SELL FAILED — ${item.symbol} (${item.label}): ${note}. Bag may still be open — manual review.`);
+  };
+  try {
+    ensureSellSignal(item, evm);
+    const trader = takerFor(item.chain);
+    const quote = await quoter.quoteSell(liveQuoteRequest(item.chain, {
+      sellToken: item.tokenMint,
+      buyToken: item.quoteMint,
+      sellAmountBaseUnits: qty.toString(),
+      slippageBps,
     }));
     const res = evm
-      ? await zeroex.sell({ quote, taker: trader, slippageBps: config.entry.slippageBps })
-      : await jupiter.sell({ quote, taker: trader, slippageBps: config.entry.slippageBps });
+      ? await zeroex.sell({ quote, taker: trader, slippageBps })
+      : await jupiter.sell({ quote, taker: trader, slippageBps });
     if (!res.hash) throw new Error("live sell returned no signature");
-    journal = markSubmitted(journal, id, "SELL", res.hash);
+    journal = markSubmitted(journal, item.positionId, "SELL", res.hash, item.label);
     saveLiveOrders(journal);
     await deps.notify(buildLiveSubmittedMessage({
-      symbol: position.symbol, chain: position.chain, side: "SELL",
-      sizeUsd: sizeUsdForReport,
+      symbol: item.symbol, chain: item.chain, side: "SELL",
+      sizeUsd: item.sizeUsdForReport,
       signature: res.hash,
     }));
     // Confirmed fill, independent of the executor's own parse on Solana;
@@ -451,49 +673,127 @@ async function liveSellFlow(
     const fill = evm
       ? { sellAmountBaseUnits: res.sellAmount, buyAmountBaseUnits: res.buyAmount }
       : await fetchConfirmedFill(res.hash);
-    const applied = applyLiveFill(mirror, id, fill.sellAmountBaseUnits);
-    mirror = applied;
+    mirror = applyLiveFill(mirror, item.positionId, fill.sellAmountBaseUnits);
     saveLivePositions(mirror);
-    journal = markConfirmed(journal, id, "SELL");
+    journal = markConfirmed(journal, item.positionId, "SELL", item.label);
     saveLiveOrders(journal);
-    trackPending(id, false);
-    // Actual USD proceeds from the confirmed buy (quote) currency.
-    const basis = quoteUsd(paperPrice, pair);
-    const buyDec = await buyDecimalsFor(position.chain, pair.quoteToken.address, position.quoteSymbol);
+    trackPending(item.positionId, false);
+    dequeue(item.positionId, item.label);
+    // USD proceeds need a mark price; sweeper orphans have none, so their
+    // PnL stays unattributed (mirror + journal still record the fill).
+    const hasMark = Number.isFinite(item.paperPrice) && item.paperPrice > 0;
     let proceedsUsd = 0;
-    if (basis && buyDec !== null) {
-      proceedsUsd = (Number(BigInt(fill.buyAmountBaseUnits)) / 10 ** buyDec) * basis.qp;
+    if (hasMark) {
+      const qp = quotePriceUsd(item.paperPrice, Number(item.priceNative), item.quoteSymbol);
+      const buyDec = await buyDecimalsFor(item.chain, item.quoteMint, item.quoteSymbol);
+      if (qp !== null && buyDec !== null) {
+        proceedsUsd = (Number(BigInt(fill.buyAmountBaseUnits)) / 10 ** buyDec) * qp;
+      }
     }
-    const realized = realizedShare(
-      proceedsUsd,
-      live.entryCostUsd,
-      BigInt(fill.sellAmountBaseUnits),
-      BigInt(live.originalBaseUnits),
-    );
-    liveState.recordRealizedPnl(realized);
-    if (detail === "EXIT") {
-      mirror = closeLivePosition(mirror, id);
+    const realized = hasMark
+      ? realizedShare(proceedsUsd, live.entryCostUsd, BigInt(fill.sellAmountBaseUnits), BigInt(live.originalBaseUnits))
+      : 0;
+    if (hasMark) liveState.recordRealizedPnl(realized);
+    if (item.kind === "EXIT") {
+      mirror = closeLivePosition(mirror, item.positionId);
       saveLivePositions(mirror);
     }
     syncCounts();
     persistLiveState();
-    const rowDetail = detail === "TP" ? (`LIVE_TP${level ?? 0}` as const) : ("LIVE_EXIT" as const);
-    await recordFill(liveFillRow(position, rowDetail, paperPrice, Number(sellBaseUnits), proceedsUsd));
+    const rowDetail = item.kind === "TP" ? (`LIVE_TP${item.level ?? 0}` as const) : ("LIVE_EXIT" as const);
+    await recordFill(liveFillRow(liveFillInfo(item), rowDetail, hasMark ? item.paperPrice : 0, Number(qty), proceedsUsd));
     await deps.notify(buildLiveFillConfirmedMessage({
-      symbol: position.symbol, chain: position.chain,
-      kind: detail === "TP" ? "TP" : "EXIT",
-      ...(level !== undefined ? { level } : {}),
-      price: paperPrice,
+      symbol: item.symbol, chain: item.chain,
+      kind: item.kind === "TP" ? "TP" : "EXIT",
+      ...(item.level !== undefined ? { level: item.level } : {}),
+      price: hasMark ? item.paperPrice : null,
       sellAmount: fill.sellAmountBaseUnits,
       buyAmount: fill.buyAmountBaseUnits,
       signature: res.hash,
       realizedPnlUsd: realized,
     }));
     if (liveState.isHalted()) {
-      await deps.notify(`🛑 DAILY LOSS LIMIT — live entries halted (loss $${liveState.dailyLossUsd.toFixed(2)})`);
+      await deps.notify(`🛑 DAILY LOSS LIMIT — live entries halted (net $${liveState.dailyNetPnlUsd.toFixed(2)}, open exposure $${liveState.liveOpenExposureUsd.toFixed(2)})`);
     }
   } catch (error) {
-    failOrder(deps, id, "SELL", String(error).slice(0, 200));
+    await fail(String(error).slice(0, 200), true);
+  }
+}
+
+/**
+ * Sweeper: live bags whose paper position is gone still need an exit.
+ * Reaps full remainders (quote mint from the mirror, else the EVM journal
+ * meta). Positions already terminal-FAILED stay manual-review — the sweeper
+ * never fights the operator. Throttled alerts only.
+ */
+function sweepOrphans(deps: LiveDeps, paperPositions: Map<string, Position>): void {
+  for (const live of mirror) {
+    if (live.status !== "OPEN") continue;
+    if (paperPositions.has(live.positionId)) continue;
+    if (pendingSells.some((p) => p.positionId === live.positionId)) continue;
+    const terminallyFailed = journal.some(
+      (o) => o.positionId === live.positionId && o.side === "SELL" && o.status === "FAILED",
+    );
+    if (terminallyFailed) continue;
+    let quoteMint = live.quoteMint ?? null;
+    if (!quoteMint && isEvmChain(live.chain)) {
+      const meta = journal.find((o) => o.positionId === live.positionId)?.meta;
+      if (meta?.buyToken) quoteMint = meta.buyToken;
+    }
+    if (!quoteMint) {
+      if (!sweepAlerted.has(live.positionId)) {
+        sweepAlerted.add(live.positionId);
+        deps.log(`⚠️ live orphan ${live.positionId}: quote U unknown, cannot sweep — manual review`);
+        void deps.notify(`⚠️ LIVE ORPHAN — ${live.positionId}: paper gone and quote U unknown. Manual review.`);
+      }
+      continue;
+    }
+    sweepAlerted.delete(live.positionId);
+    const ok = enqueue({
+      positionId: live.positionId,
+      chain: live.chain,
+      symbol: live.positionId,
+      tokenName: "",
+      dexId: "",
+      pairAddress: "",
+      poolAddress: "",
+      tokenMint: live.tokenMint,
+      quoteMint,
+      quoteSymbol: "",
+      priceNative: "",
+      kind: "EXIT",
+      label: "EXIT",
+      sellBaseUnits: live.remainingBaseUnits,
+      paperPrice: NaN,
+      sizeUsdForReport: live.entryCostUsd,
+    });
+    if (ok) {
+      trackPending(live.positionId, true);
+      deps.log(`🧹 live sweeper: queued orphan EXIT ${live.positionId}`);
+    }
+  }
+}
+
+/**
+ * Background pump: execute due sells (2 concurrent) and sweep orphans.
+ * No-op unless live trading is enabled. Never throws.
+ */
+export async function pumpLiveSells(deps: LiveDeps, paperPositions: Map<string, Position>): Promise<void> {
+  if (!liveTradingEnabled()) return;
+  if (pumping) return;
+  pumping = true;
+  try {
+    const now = Date.now();
+    if (now - lastSweepAt >= SELL_SWEEP_MS) {
+      lastSweepAt = now;
+      sweepOrphans(deps, paperPositions);
+    }
+    const due = pendingSells.filter((p) => p.nextAttemptAt <= Date.now()).slice(0, SELL_PUMP_CONCURRENCY);
+    await Promise.all(due.map((item) => executePendingSell(deps, item)));
+  } catch (error) {
+    deps.log(`⚠️ live sell pump: ${String(error).slice(0, 150)}`);
+  } finally {
+    pumping = false;
   }
 }
 
@@ -526,7 +826,30 @@ export async function maybeLiveTp(
     deps.log(`⚠️ live TP${event.level} ${position.id}: nothing left to sell live`);
     return;
   }
-  await liveSellFlow(deps, position, pair, capped, "TP", event.level, event.price, event.proceedsUsd);
+  const label = `TP${event.level}`;
+  const ok = enqueue({
+    positionId: position.id,
+    chain: position.chain,
+    symbol: position.symbol,
+    tokenName: position.tokenName,
+    dexId: position.dexId,
+    pairAddress: position.pairAddress,
+    poolAddress: position.poolAddress ?? "",
+    tokenMint: position.tokenAddress,
+    quoteMint: pair.quoteToken.address,
+    quoteSymbol: position.quoteSymbol,
+    priceNative: pair.priceNative ?? "",
+    kind: "TP",
+    level: event.level,
+    label,
+    sellBaseUnits: capped.toString(),
+    paperPrice: event.price,
+    sizeUsdForReport: event.proceedsUsd,
+  });
+  if (ok) {
+    trackPending(position.id, true);
+    deps.log(`⏳ live ${label} ${position.id} queued`);
+  }
 }
 
 /** Live final-exit mirror after the paper close booked. Never throws. */
@@ -548,5 +871,26 @@ export async function maybeLiveExit(
     deps.log(`⚠️ live exit ${position.id}: live remainder already zero`);
     return;
   }
-  await liveSellFlow(deps, position, pair, remaining, "EXIT", undefined, exitPrice, event.proceedsUsd);
+  const ok = enqueue({
+    positionId: position.id,
+    chain: position.chain,
+    symbol: position.symbol,
+    tokenName: position.tokenName,
+    dexId: position.dexId,
+    pairAddress: position.pairAddress,
+    poolAddress: position.poolAddress ?? "",
+    tokenMint: position.tokenAddress,
+    quoteMint: pair.quoteToken.address,
+    quoteSymbol: position.quoteSymbol,
+    priceNative: pair.priceNative ?? "",
+    kind: "EXIT",
+    label: "EXIT",
+    sellBaseUnits: remaining.toString(),
+    paperPrice: exitPrice,
+    sizeUsdForReport: event.proceedsUsd,
+  });
+  if (ok) {
+    trackPending(position.id, true);
+    deps.log(`⏳ live EXIT ${position.id} queued`);
+  }
 }

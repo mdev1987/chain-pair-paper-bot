@@ -70,10 +70,13 @@ export async function reconcileLiveState(
   };
   let journal = orders;
   for (const order of openOrders(orders)) {
+    // Labeled orders (TP1/EXIT) resolve under their own label.
+    const label = order.label ?? "";
+    const refind = (): LiveOrder =>
+      journal.find((o) => o.positionId === order.positionId && o.side === order.side && (o.label ?? "") === label)!;
     if (order.status === "SIGNAL" || !order.signature) {
-      journal = markFailed(journal, order.positionId, order.side, "never submitted (SIGNAL at shutdown)");
-      const done = journal.find((o) => o.positionId === order.positionId && o.side === order.side)!;
-      report.failed.push(done);
+      journal = markFailed(journal, order.positionId, order.side, "never submitted (SIGNAL at shutdown)", label);
+      report.failed.push(refind());
       continue;
     }
     let status: ChainTxStatus;
@@ -88,18 +91,16 @@ export async function reconcileLiveState(
     if (status === "confirmed") {
       try {
         const fill = await deps.fetchFill(order.signature);
-        journal = markConfirmed(journal, order.positionId, order.side);
-        const done = journal.find((o) => o.positionId === order.positionId && o.side === order.side)!;
-        report.confirmed.push({ order: done, fill });
+        journal = markConfirmed(journal, order.positionId, order.side, label);
+        report.confirmed.push({ order: refind(), fill });
       } catch (error) {
         report.discrepancies.push(
           `confirmed ${order.signature} but fill unreadable: ${String(error).slice(0, 120)}`,
         );
       }
     } else if (status === "failed") {
-      journal = markFailed(journal, order.positionId, order.side, "failed on-chain before shutdown");
-      const done = journal.find((o) => o.positionId === order.positionId && o.side === order.side)!;
-      report.failed.push(done);
+      journal = markFailed(journal, order.positionId, order.side, "failed on-chain before shutdown", label);
+      report.failed.push(refind());
     } else {
       report.stillMissing.push(order);
     }

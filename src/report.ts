@@ -22,6 +22,7 @@ export function exitBadge(reason: string | undefined): string {
     case "TRAIL_EXIT": return "📉 TRAILING EXIT";
     case "STOP_EXIT": return "🔴 STOP EXIT";
     case "EARLY_STOP": return "🛑 EARLY STOP";
+    case "DRAIN_EXIT": return "🌊 DRAIN EXIT";
     case "BREAKEVEN_STOP": return "🛟 BREAKEVEN STOP";
     case "TIME_EXIT": return "⏱ TIME EXIT";
     default: return `🏁 CLOSED (${reason ?? "unknown"})`;
@@ -196,7 +197,7 @@ export function buildCloseMessage(r: CloseReport): string {
     `📈 PnL: ${fmtSignedUsd(pnlUsd)} (${fmtPct(pnlPct)})`,
     `🧾 Net model (${SHADOW_COST_MODEL}): ${fmtSignedUsd(pnlUsd - p.shadowFeeUsd - p.shadowSlipUsd)}`,
     `💸 Fees: ${fmtUsd(p.totalEntryFeeUsd + p.totalExitFeeUsd)}  |  🌊 Slippage: ${fmtUsd(p.totalSlippageUsd)}`,
-    `💰 Balance: ${fmtUsd(before)} → ${fmtUsd(after)} (Δ ${fmtSignedUsd(delta)})`,
+    `💰 Balance (equity incl. other positions): ${fmtUsd(before)} → ${fmtUsd(after)} (Δ ${fmtSignedUsd(delta)})`,
     `📦 Size: ${fmtUsd(p.initialUsdSize)}  |  ⏳ Duration: ${fmtDuration(holdMs)} (${fmtTime(p.openedAt)} → ${fmtTime(p.closedAt ?? Date.now())})`,
     `📊 Portfolio: #${r.snapshot.totalTrades}  |  Win ${r.snapshot.winRatePct.toFixed(1)}% (${r.snapshot.wins}W/${r.snapshot.losses}L)  |  Total ${fmtSignedUsd(r.snapshot.totalPnlUsd)}  |  Equity ${fmtUsd(r.snapshot.equityUsd)}`,
     `${chainIcon(p.chain)} ${p.chain}: ${r.chainStat.trades} trades, ${chainWinRate.toFixed(1)}% win, ${fmtSignedUsd(r.chainStat.pnlUsd)}`,

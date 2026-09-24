@@ -1,5 +1,5 @@
 import { config } from "./config.ts";
-import type { Position } from "./types.ts";
+import type { ExitProfile, Position } from "./types.ts";
 
 /**
  * Shadow cost model for research (reported as NET_PNL_100BPS_1PCT).
@@ -21,7 +21,37 @@ export type PositionEvent =
   | { type: "STOP_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
   | { type: "EARLY_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
   | { type: "BREAKEVEN_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
+  | { type: "DRAIN_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number }
   | { type: "TIME_EXIT"; price: number; soldQty: number; proceedsUsd: number; realizedPnlUsd: number; gainPct: number };
+
+export interface UpdateOptions {
+  /** Venue liquidity USD on this print — enables drain/dead exits. */
+  liquidityUsd?: number;
+}
+
+/**
+ * Resolved exit numbers: the position's snapshot profile when present,
+ * global config otherwise. Every threshold in updatePosition reads through
+ * here so unprofiled positions (and all unit tests) behave exactly as before.
+ */
+function exitsOf(position: Position): ExitProfile {
+  const p = position.exitProfile;
+  return {
+    tp: p?.tp ?? config.tp,
+    initialStopPct: p?.initialStopPct ?? config.stops.initialPct,
+    trailActivationPct: p?.trailActivationPct ?? config.stops.trailActivationPct,
+    trailDistancePct: p?.trailDistancePct ?? config.stops.trailDistancePct,
+    trailConfirmTicks: p?.trailConfirmTicks ?? 1,
+    breakevenArmPct: p?.breakevenArmPct ?? config.dynamic.breakevenArmPct,
+    breakevenBufferPct: p?.breakevenBufferPct ?? config.dynamic.breakevenBufferPct,
+    breakevenAfterTp1: p?.breakevenAfterTp1 ?? config.dynamic.breakevenAfterTp1,
+    earlyStopPct: p?.earlyStopPct ?? config.earlyStop.stopPct,
+    earlyStopWindowSec: p?.earlyStopWindowSec ?? config.earlyStop.windowSec,
+    maxPositionAgeMin: p?.maxPositionAgeMin ?? config.entry.maxPositionAgeMin,
+    drainLiquidityPct: p?.drainLiquidityPct ?? 25,
+    deadLiquidityUsd: p?.deadLiquidityUsd ?? 25,
+  };
+}
 
 function gainPct(position: Position, marketPrice: number): number {
   return ((marketPrice / position.entryPrice) - 1) * 100;
@@ -40,20 +70,25 @@ function exitFee(price: number, quantity: number): number {
 }
 
 export function initialStopPrice(position: Position): number {
-  return position.entryPrice * (1 - config.stops.initialPct / 100);
+  return position.entryPrice * (1 - exitsOf(position).initialStopPct / 100);
 }
 
 /** Dead-on-arrival stop for fresh positions (tighter than the initial stop). */
 export function earlyStopPrice(position: Position): number {
-  return position.entryPrice * (1 - config.earlyStop.stopPct / 100);
+  return position.entryPrice * (1 - exitsOf(position).earlyStopPct / 100);
 }
 
 export function breakevenStopPrice(position: Position): number {
-  return position.entryPrice * (1 + config.dynamic.breakevenBufferPct / 100);
+  return position.entryPrice * (1 + exitsOf(position).breakevenBufferPct / 100);
+}
+
+/** Confirmed trail high, backfilled from the single-print high. */
+export function trailHighOf(position: Position): number {
+  return position.trailHigh ?? position.highestPrice;
 }
 
 export function trailingStopPrice(position: Position): number {
-  return position.highestPrice * (1 - config.stops.trailDistancePct / 100);
+  return trailHighOf(position) * (1 - exitsOf(position).trailDistancePct / 100);
 }
 
 /** Dynamic protective stop: trailing > breakeven (once armed) > initial.
@@ -94,6 +129,19 @@ function closePosition(position: Position, marketPrice: number, reason: Position
   return { soldQty: qty, proceedsUsd };
 }
 
+/**
+ * Close a remainder that cannot be sold at any price (venue liquidity at
+ * dust). Banked TP proceeds stay in realizedPnlUsd; the leftover quantity
+ * is written to zero with zero proceeds instead of a fantasy fill.
+ */
+function closeWorthless(position: Position, reason: Position["closedReason"], now: number): { soldQty: number; proceedsUsd: number } {
+  position.quantity = 0;
+  position.status = "CLOSED";
+  position.closedReason = reason;
+  position.closedAt = now;
+  return { soldQty: 0, proceedsUsd: 0 };
+}
+
 export function openPosition(args: {
   id: string;
   chain: string;
@@ -110,6 +158,7 @@ export function openPosition(args: {
   poolAddress?: string;
   entryLiquidityUsd?: number;
   entryAgeSec?: number;
+  exitProfile?: ExitProfile;
   now?: number;
 }): Position {
   if (!Number.isFinite(args.marketPrice) || args.marketPrice <= 0) {
@@ -160,8 +209,13 @@ export function openPosition(args: {
 
     trailingActive: false,
     breakevenArmed: false,
+    // Confirmed trail high starts at the entry print; the first update
+    // ratchets it like highestPrice when trailConfirmTicks is 1.
+    trailHigh: args.marketPrice,
+    highStreak: 0,
     status: "OPEN",
     tpHit: [false, false, false],
+    ...(args.exitProfile !== undefined ? { exitProfile: args.exitProfile } : {}),
     ...(args.balanceBeforeUsd !== undefined ? { balanceBeforeUsd: args.balanceBeforeUsd } : {}),
     ...(args.poolAddress !== undefined ? { poolAddress: args.poolAddress } : {}),
     ...(args.entryLiquidityUsd !== undefined ? { entryLiquidityUsd: args.entryLiquidityUsd } : {}),
@@ -173,10 +227,12 @@ export function updatePosition(
   position: Position,
   marketPrice: number,
   now = Date.now(),
+  opts: UpdateOptions = {},
 ): PositionEvent[] {
   if (position.status !== "OPEN") return [];
   if (!Number.isFinite(marketPrice) || marketPrice <= 0) return [];
 
+  const ex = exitsOf(position);
   position.currentPrice = marketPrice;
   position.updatedAt = now;
   // Full path tracking for MFE/MAE/giveback research (see tradeRecordFromPosition).
@@ -188,6 +244,19 @@ export function updatePosition(
     position.lowestPrice = marketPrice;
     position.lowestAt = now;
   }
+  // Wick-proof trail high: ratchets only after trailConfirmTicks consecutive
+  // prints above it, so a single wick never drags the stop up. With the
+  // default of 1 this matches highestPrice exactly.
+  if (position.trailHigh === undefined) position.trailHigh = position.highestPrice;
+  if (position.highStreak === undefined) position.highStreak = 0;
+  if (marketPrice > position.trailHigh) {
+    position.highStreak += 1;
+    if (position.highStreak >= ex.trailConfirmTicks) {
+      position.trailHigh = marketPrice;
+    }
+  } else {
+    position.highStreak = 0;
+  }
 
   const events: PositionEvent[] = [];
   const gain = gainPct(position, marketPrice);
@@ -196,8 +265,32 @@ export function updatePosition(
   // rather than letting the boundary be decided by rounding luck.
   const EPS = 1e-9;
 
-  for (let i = 0; i < config.tp.length; i++) {
-    const level = config.tp[i]!;
+  // Dead pool: venue liquidity at dust means the remainder is unexitable —
+  // book it worthless instead of a fantasy fill. Runs before TPs so a dead
+  // pool printing a high number cannot book partials into nothing.
+  if (opts.liquidityUsd !== undefined && opts.liquidityUsd <= ex.deadLiquidityUsd) {
+    position.exitTriggerPrice = marketPrice;
+    const { soldQty, proceedsUsd } = closeWorthless(position, "DRAIN_EXIT", now);
+    events.push({ type: "DRAIN_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
+    return events;
+  }
+
+  // Drain exit: liquidity collapsed below a fraction of entry — hard exit at
+  // the observed print while something may still be recoverable.
+  if (
+    opts.liquidityUsd !== undefined &&
+    position.entryLiquidityUsd !== undefined &&
+    position.entryLiquidityUsd > 0 &&
+    opts.liquidityUsd < position.entryLiquidityUsd * (ex.drainLiquidityPct / 100)
+  ) {
+    position.exitTriggerPrice = marketPrice;
+    const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "DRAIN_EXIT", now);
+    events.push({ type: "DRAIN_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
+    return events;
+  }
+
+  for (let i = 0; i < ex.tp.length; i++) {
+    const level = ex.tp[i]!;
     if (position.tpHit[i]) continue;
     // Order-independent: a level below the current gain must not block
     // later levels when TP gains are misordered. Startup config validation
@@ -209,6 +302,8 @@ export function updatePosition(
       position.originalQuantity * (level.sellPct / 100),
       marketPrice,
     );
+    // Marked hit even when dust rounds the fill to zero: no event is
+    // emitted, but the level must not retry on later ticks.
     position.tpHit[i] = true;
 
     if (sold > 0) {
@@ -230,8 +325,8 @@ export function updatePosition(
   // fallback — until the trailing stop takes over.
   if (
     !position.breakevenArmed &&
-    (gain + EPS >= config.dynamic.breakevenArmPct ||
-      (config.dynamic.breakevenAfterTp1 && position.tpHit[0] === true))
+    (gain + EPS >= ex.breakevenArmPct ||
+      (ex.breakevenAfterTp1 && position.tpHit[0] === true))
   ) {
     position.breakevenArmed = true;
     events.push({
@@ -242,7 +337,7 @@ export function updatePosition(
     });
   }
 
-  if (!position.trailingActive && gain + EPS >= config.stops.trailActivationPct) {
+  if (!position.trailingActive && gain + EPS >= ex.trailActivationPct) {
     position.trailingActive = true;
     events.push({ type: "TRAIL_ACTIVATED", price: marketPrice, trailStop: trailingStopPrice(position) });
   }
@@ -251,7 +346,7 @@ export function updatePosition(
   const breakevenStop = breakevenStopPrice(position);
   const initialStop = initialStopPrice(position);
   const earlyStop = earlyStopPrice(position);
-  const withinEarlyWindow = now - position.openedAt < config.earlyStop.windowSec * 1000;
+  const withinEarlyWindow = now - position.openedAt < ex.earlyStopWindowSec * 1000;
 
   if (position.trailingActive && marketPrice <= trailingStop) {
     position.exitTriggerPrice = trailingStop;
@@ -279,7 +374,7 @@ export function updatePosition(
     position.exitTriggerPrice = initialStop;
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "STOP_EXIT", now);
     events.push({ type: "STOP_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });
-  } else if (now - position.openedAt >= config.entry.maxPositionAgeMin * 60_000) {
+  } else if (now - position.openedAt >= ex.maxPositionAgeMin * 60_000) {
     position.exitTriggerPrice = marketPrice;
     const { soldQty, proceedsUsd } = closePosition(position, marketPrice, "TIME_EXIT", now);
     events.push({ type: "TIME_EXIT", price: marketPrice, soldQty, proceedsUsd, realizedPnlUsd: position.realizedPnlUsd, gainPct: gain });

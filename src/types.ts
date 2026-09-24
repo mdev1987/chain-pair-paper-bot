@@ -36,6 +36,31 @@ export interface Candidate {
 
 export type PositionStatus = "OPEN" | "CLOSED";
 
+/**
+ * Per-chain exit regime attached at open. Absent = global config behavior
+ * (and every unit test). Lets Solana bank fast with a short leash while
+ * Robinhood keeps a larger runner — same engine, different regime.
+ */
+export interface ExitProfile {
+  /** 1–3 TP levels, gains strictly ascending, sells % of ORIGINAL qty. */
+  tp: ReadonlyArray<{ gainPct: number; sellPct: number }>;
+  initialStopPct: number;
+  trailActivationPct: number;
+  trailDistancePct: number;
+  /** Consecutive ticks above the trail high required to ratchet (wick-proofing). 1 = every print. */
+  trailConfirmTicks: number;
+  breakevenArmPct: number;
+  breakevenBufferPct: number;
+  breakevenAfterTp1: boolean;
+  earlyStopPct: number;
+  earlyStopWindowSec: number;
+  maxPositionAgeMin: number;
+  /** Hard drain exit when venue liquidity falls below this % of entry. */
+  drainLiquidityPct: number;
+  /** Remainder is worthless below this venue liquidity USD (unexitable). */
+  deadLiquidityUsd: number;
+}
+
 export interface Position {
   id: string;
   chain: string;
@@ -85,11 +110,31 @@ export interface Position {
 
   trailingActive: boolean;
   breakevenArmed: boolean;
+  /**
+   * Confirmed trail high (wick-proof: see trailConfirmTicks). Optional for
+   * state-file compatibility — pre-trail positions backfill from
+   * highestPrice on first update.
+   */
+  trailHigh?: number;
+  /** Consecutive ticks printing above trailHigh (ratchet progress). */
+  highStreak?: number;
   status: PositionStatus;
   tpHit: [boolean, boolean, boolean];
+  /**
+   * Exit regime snapshot at open. Optional for state-file compatibility:
+   * pre-profile positions fall back to global config.
+   */
+  exitProfile?: ExitProfile;
   /** Portfolio equity just before entry (set by caller for reporting). */
   balanceBeforeUsd?: number;
-  /** Portfolio equity just after full close (set by caller for reporting). */
+  /**
+   * Portfolio EQUITY (cash + open-position market value) just after full
+   * close — not cash. Named balanceAfterUsd for state-file compatibility;
+   * compare against balanceBeforeUsd (also equity) or the ledger's
+   * cash/equity columns, never against cash alone. Other open positions
+   * move between entry and close, so after-minus-before is portfolio drift,
+   * not this trade's PnL (see totalPnlUsd for the trade itself).
+   */
   balanceAfterUsd?: number;
   /** DexPaprika pool id from discovery (may differ from DexScreener pairAddress). */
   poolAddress?: string;

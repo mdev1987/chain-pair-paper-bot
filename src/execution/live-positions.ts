@@ -29,6 +29,11 @@ export interface LivePosition {
   originalBaseUnits: string;
   /** USD spent on entry (for realized-PnL cost shares). */
   entryCostUsd: number;
+  /**
+   * Quote-currency mint for exits (sweeper needs it after paper is gone).
+   * Absent on mirrors opened before this field existed.
+   */
+  quoteMint?: string;
   status: "OPEN" | "CLOSED";
   openedAt: number;
   updatedAt: number;
@@ -51,6 +56,7 @@ function isLivePosition(value: unknown): value is LivePosition {
     p.positionId.length > 0 &&
     typeof p.chain === "string" &&
     typeof p.tokenMint === "string" &&
+    (p.quoteMint === undefined || typeof p.quoteMint === "string") &&
     isBigStr(p.remainingBaseUnits) &&
     isBigStr(p.filledBaseUnits) &&
     isBigStr(p.originalBaseUnits) &&
@@ -89,7 +95,7 @@ export function saveLivePositions(
 
 export function openLivePosition(
   positions: LivePosition[],
-  input: { positionId: string; chain: string; tokenMint: string; filledBaseUnits: string; entryCostUsd: number },
+  input: { positionId: string; chain: string; tokenMint: string; filledBaseUnits: string; entryCostUsd: number; quoteMint?: string },
 ): LivePosition[] {
   if (positions.some((p) => p.positionId === input.positionId && p.status === "OPEN")) {
     throw new Error(`Live position already open: ${input.positionId}`);
@@ -115,6 +121,7 @@ export function openLivePosition(
       filledBaseUnits: filled.toString(),
       originalBaseUnits: filled.toString(),
       entryCostUsd: input.entryCostUsd,
+      ...(input.quoteMint !== undefined ? { quoteMint: input.quoteMint } : {}),
       status: "OPEN",
       openedAt: now,
       updatedAt: now,

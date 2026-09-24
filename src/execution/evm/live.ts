@@ -17,8 +17,9 @@ import { v4StateViewFor } from "./v4.ts";
  *
  * Design notes:
  * - One shared flow for every EVM quote carrying calldata (0x, V2-direct).
- *   V4-direct quotes carry NO calldata (no PoolKey) and are refused here —
- *   route V4 execution through 0x, which abstracts the pool key away.
+ *   V4-direct quotes carry NO calldata yet (the PoolKey is recoverable via
+ *   Initialize logs — see recoverV4PoolKey — but UniversalRouter encoding
+ *   is not built) and are refused here; route V4 execution through 0x.
  * - Approvals are max-allowance per token per spender: the hot wallet is
  *   throwaway by policy, and per-trade approvals would double the tx count
  *   on a 60-second strategy. Revoke via revoke.cash if a key is retired.

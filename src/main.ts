@@ -1,4 +1,5 @@
 import { config, isEntryPausedAt } from "./config.ts";
+import { resolveExitProfile } from "./config.ts";
 import { fetchNewestPools } from "./dexpaprika.ts";
 import {
   assessConfirmation,
@@ -17,6 +18,7 @@ import {
 import { Portfolio } from "./portfolio.ts";
 import { loadState, saveState } from "./store.ts";
 import {
+  analyticsQuery,
   analyticsStatus,
   closeAnalytics,
   initAnalytics,
@@ -48,11 +50,23 @@ import {
   simulateSwap,
 } from "./execution/simulate.ts";
 import { EVM_CHAIN_IDS, evmRpcFallbackChains, evmRpcSources } from "./execution/evm/viem-client.ts";
-import { initLive, maybeLiveEnter, maybeLiveExit, maybeLiveTp } from "./live.ts";
+import { initLive, maybeLiveEnter, maybeLiveExit, maybeLiveTp, pumpLiveSells } from "./live.ts";
 import { maybeLiveTestTrade } from "./live-test.ts";
+import { claimInstanceLockForStateFile } from "./instance-lock.ts";
+import {
+  assessSolanaMint,
+  assessV4Hooks,
+  getSolanaMintSafety,
+  quoteDeviationPct,
+  recoverV4PoolKey,
+} from "./execution/safety.ts";
+import {
+  paperLossLimitBreached,
+  recentStopCount,
+  rollingExpectancyNegative,
+} from "./breakers.ts";
 
 const seenPools = new Map<string, number>();
-const candidates = new Map<string, Candidate>();
 const positions = new Map<string, Position>();
 const portfolio = new Portfolio(config.portfolio.initialBalanceUsd);
 
@@ -112,6 +126,8 @@ function restore(): void {
     position.highestAt ??= position.updatedAt;
     position.shadowFeeUsd ??= 0;
     position.shadowSlipUsd ??= 0;
+    position.trailHigh ??= position.highestPrice;
+    position.highStreak ??= 0;
     positions.set(position.id, position);
     // Restore the fee/slippage baseline so post-restart fills record
     // incremental (delta) costs instead of re-counting lifetime totals.
@@ -127,6 +143,34 @@ function restore(): void {
     `cash $${portfolio.cashUsd.toFixed(2)}, ` +
     `${portfolio.closedTrades.length} closed trades${age}`,
   );
+  // One line per restored position: without it a restart silently drops the
+  // BUY announcements (no re-send on restore) and the closes later arrive
+  // for positions Telegram never showed — this log is the audit trail.
+  for (const position of positions.values()) {
+    log(`♻️ restored ${position.id} ${position.symbol} entry=$${position.entryPrice.toPrecision(8)} qty=${position.quantity.toPrecision(6)}`);
+  }
+}
+
+/**
+ * Boot reconciliation: the DuckDB ledger is best-effort and fails silently,
+ * so compare its trade count against state.json at startup and say so when
+ * they disagree (analytics will undercount until the gap is understood).
+ */
+async function reconcileLedgerWithState(): Promise<void> {
+  if (!config.analytics.enabled) return;
+  if (!analyticsStatus().startsWith("ready")) return;
+  try {
+    const rows = await analyticsQuery<{ n: bigint | number }>("SELECT COUNT(*) AS n FROM trades");
+    const ledgerTrades = Number(rows[0]?.n ?? 0);
+    const stateTrades = portfolio.closedTrades.length;
+    if (ledgerTrades !== stateTrades) {
+      log(`⚠️ ledger gap: state.json holds ${stateTrades} closed trades but DuckDB has ${ledgerTrades} — some closes never reached the ledger; per-trade analytics will undercount`);
+    } else {
+      log(`📊 ledger reconcile OK: ${ledgerTrades} trades`);
+    }
+  } catch (error) {
+    log(`⚠️ ledger reconcile failed: ${String(error)}`);
+  }
 }
 
 function log(message: string): void {
@@ -141,6 +185,51 @@ function logPausedHourThrottled(): void {
   if (now - lastPausedHourLogMs < 3_600_000) return;
   lastPausedHourLogMs = now;
   log(`⏸️ entries paused (dead UTC hour ${new Date().getUTCHours()}:00) — exits continue`);
+}
+
+// --- Portfolio entry gates: per-chain breaker pauses, expectancy gate and
+// paper daily-loss limit. Exits always run; only NEW entries pause.
+const chainPauseUntilMs = new Map<string, number>();
+const chainGateLogAt = new Map<string, number>();
+
+function openCountForChain(chain: string): number {
+  let n = 0;
+  for (const p of positions.values()) {
+    if (p.status === "OPEN" && p.chain === chain) n += 1;
+  }
+  return n;
+}
+
+function gateLogThrottled(key: string, message: string): void {
+  const now = Date.now();
+  if (now - (chainGateLogAt.get(key) ?? 0) < 15 * 60_000) return;
+  chainGateLogAt.set(key, now);
+  log(message);
+}
+
+/** False when this chain must not open new entries right now. */
+function chainEntriesAllowed(chain: string): boolean {
+  const now = Date.now();
+  if (now < (chainPauseUntilMs.get(chain) ?? 0)) return false; // logged once at trip
+  const stops = recentStopCount(portfolio.closedTrades, chain, now, config.risk.breakerWindowMin);
+  if (stops >= config.risk.breakerStops) {
+    chainPauseUntilMs.set(chain, now + config.risk.breakerPauseMin * 60_000);
+    log(`🛑 breaker: ${chain} entries paused ${config.risk.breakerPauseMin}m after ${stops} stops/drains in ${config.risk.breakerWindowMin}m`);
+    return false;
+  }
+  if (rollingExpectancyNegative(portfolio.closedTrades, chain, config.risk.expectancyTrades)) {
+    gateLogThrottled(`exp:${chain}`, `⏸️ ${chain} entries gated: last ${config.risk.expectancyTrades} closed net negative`);
+    return false;
+  }
+  return true;
+}
+
+function paperEntriesAllowed(): boolean {
+  if (!paperLossLimitBreached(portfolio.closedTrades, config.risk.paperDailyLossLimitUsd, Date.now())) {
+    return true;
+  }
+  gateLogThrottled("paperloss", `⏸️ entries gated: paper daily loss limit $${config.risk.paperDailyLossLimitUsd} hit (exits continue)`);
+  return false;
 }
 
 /**
@@ -380,9 +469,12 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
     poolCreatedAt: pool.createdAtMs,
   };
 
-  candidates.set(key, candidate);
   // Mark only after DexScreener resolution and candidate acceptance.
   // This lets transient DS failures and newly-active pools be retried.
+  // Post-acceptance skips below (impact guard, confirm fail, cap, cash)
+  // are TERMINAL for this pool id within the 6h seen-window: the 60–120s
+  // age band moves on, so a pool skipped now is stale by the time
+  // conditions change.
   seenPools.set(key, Date.now());
 
   log(
@@ -398,6 +490,10 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
     logPausedHourThrottled();
     return;
   }
+  // Portfolio gates before any per-pool work: breaker pauses, expectancy
+  // gate and the paper daily-loss limit. All entry-only; exits continue.
+  if (!chainEntriesAllowed(chain)) return;
+  if (!paperEntriesAllowed()) return;
   if (positions.size >= config.entry.maxOpenPositions) return;
 
   // Per-chain sizing (uniform POSITION_SIZE_USD unless CHAIN_POSITION_SIZES
@@ -414,55 +510,299 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
     return;
   }
 
-  // Two-snapshot confirmation: re-quote after a short delay and enter on the
-  // second print. Rejects pools already sliding or draining; rising/flat
-  // prints pass freely (no momentum requirement).
-  let activePair = pair;
-  let entryPrice = price;
-  let entryLiquidity = liquidity;
-  if (config.entry.confirmEnabled) {
-    await new Promise((resolve) => setTimeout(resolve, config.entry.confirmDelayMs));
-    let fresh: DexScreenerPair | null = null;
-    try {
-      fresh = await getPair(chain, pair.pairAddress);
-    } catch (error) {
-      log(`⏭️ skip entry ${chain}:${pair.pairAddress}: re-quote failed (${String(error)})`);
+  // Entry safety layer: hard-rug-capable mints (creator-held authority,
+  // Token-2022) never reach the confirm queue. Unreadable mints pass in
+  // lenient mode so an RPC outage doesn't stillbirth every entry.
+  if (config.safety.enabled && chain === "solana") {
+    const verdict = assessSolanaMint(await getSolanaMintSafety(token.address), config.safety.strict);
+    if (!verdict.ok) {
+      log(`⏭️ skip entry ${chain}:${pair.pairAddress}: token safety (${verdict.reason})`);
       return;
     }
-    if (!fresh) {
-      log(`⏭️ skip entry ${chain}:${pair.pairAddress}: vanished on re-quote`);
+  }
+
+  // Copycat-ticker block: ONE_ENTRY_PER_POOL covers the exact pair, but a
+  // recycled name on a new pair is the documented scam pattern — treat the
+  // chain+symbol as one exposure, open or closed.
+  if (config.safety.enabled && config.safety.blockRepeatSymbols) {
+    const sym = token.symbol.toLowerCase();
+    const seenSymbol =
+      [...positions.values()].some((p) => p.chain === chain && p.symbol.toLowerCase() === sym) ||
+      portfolio.closedTrades.some((t) => t.chain === chain && t.symbol.toLowerCase() === sym);
+    if (seenSymbol) {
+      log(`⏭️ skip entry ${chain}:${pair.pairAddress}: repeat symbol ${token.symbol} on ${chain}`);
       return;
+    }
+  }
+
+  // Two-snapshot confirmation is DEFERRED, never inline: the re-quote
+  // happens in fireDueConfirms on a 1s loop so the ENTRY_CONFIRM_DELAY_MS
+  // wait never stalls pool discovery for other chains/pools.
+  if (config.entry.confirmEnabled) {
+    queueConfirm({
+      chain,
+      poolAddress: pool.poolAddress,
+      pairAddress: pair.pairAddress,
+      firstPrice: price,
+      firstLiquidity: liquidity,
+      sizeUsd,
+      poolCreatedAt: pool.createdAtMs,
+    });
+    return;
+  }
+
+  await openEntry({
+    chain,
+    poolAddress: pool.poolAddress,
+    poolCreatedAtMs: pool.createdAtMs,
+    activePair: pair,
+    entryPrice: price,
+    entryLiquidity: liquidity,
+    sizeUsd,
+  });
+}
+
+interface PendingConfirm {
+  chain: string;
+  poolAddress: string;
+  pairAddress: string;
+  firstPrice: number;
+  firstLiquidity: number;
+  sizeUsd: number;
+  poolCreatedAt: number;
+  queuedAt: number;
+  fireAt: number;
+}
+
+// Deferred entry confirmations waiting out ENTRY_CONFIRM_DELAY_MS.
+// Bounded by 2x max open positions; queued entries die with a process
+// restart (pools re-qualify through discovery on boot).
+const pendingConfirms = new Map<string, PendingConfirm>();
+
+function queueConfirm(args: Omit<PendingConfirm, "queuedAt" | "fireAt">): void {
+  const positionId = `${args.chain}:${args.pairAddress}`;
+  if (positions.has(positionId) || pendingConfirms.has(positionId)) return;
+  if (pendingConfirms.size >= Math.max(1, config.entry.maxOpenPositions) * 2) {
+    let oldestKey: string | null = null;
+    let oldestAt = Infinity;
+    for (const [k, p] of pendingConfirms) {
+      if (p.queuedAt < oldestAt) {
+        oldestAt = p.queuedAt;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey) pendingConfirms.delete(oldestKey);
+  }
+  const now = Date.now();
+  pendingConfirms.set(positionId, {
+    ...args,
+    queuedAt: now,
+    fireAt: now + config.entry.confirmDelayMs,
+  });
+  log(`⏳ ${positionId}: queued for confirm in ${config.entry.confirmDelayMs}ms`);
+}
+
+/**
+ * Fire due confirmations: re-quote each queued candidate once and enter on
+ * the second print. Rejects pools already sliding or draining; rising/flat
+ * prints pass freely (no momentum requirement). Cap, pause-gate, cash and
+ * re-entry guards are re-checked here because slots fill during the delay.
+ */
+async function fireDueConfirms(): Promise<void> {
+  if (pendingConfirms.size === 0) return;
+  const now = Date.now();
+  const due = [...pendingConfirms.entries()].filter(([, p]) => p.fireAt <= now);
+  for (const [positionId, pending] of due) {
+    pendingConfirms.delete(positionId);
+    if (now - pending.queuedAt > 60_000) {
+      log(`⏭️ drop stale confirm ${positionId}: queued ${Math.round((now - pending.queuedAt) / 1000)}s ago`);
+      continue;
+    }
+    if (isEntryPausedAt(new Date(), config.entry.pausedHoursUtc)) {
+      logPausedHourThrottled();
+      continue;
+    }
+    let fresh: DexScreenerPair | null = null;
+    try {
+      fresh = await getPair(pending.chain, pending.pairAddress);
+    } catch (error) {
+      log(`⏭️ skip entry ${pending.chain}:${pending.pairAddress}: re-quote failed (${String(error)})`);
+      continue;
+    }
+    if (!fresh) {
+      log(`⏭️ skip entry ${pending.chain}:${pending.pairAddress}: vanished on re-quote`);
+      continue;
     }
     const freshPrice = parsePrice(fresh);
     const verdict = assessConfirmation(
-      { price, liquidityUsd: liquidity },
+      { price: pending.firstPrice, liquidityUsd: pending.firstLiquidity },
       { price: freshPrice ?? NaN, liquidityUsd: pairLiquidityUsd(fresh) },
       config.entry.confirmMaxPriceDropPct,
       config.entry.confirmMaxLiqDropPct,
     );
     if (!verdict.ok || freshPrice === null) {
-      log(`⏭️ skip entry ${chain}:${pair.pairAddress}: confirm failed (${verdict.reason ?? "no-price"})`);
-      return;
+      log(`⏭️ skip entry ${pending.chain}:${pending.pairAddress}: confirm failed (${verdict.reason ?? "no-price"})`);
+      continue;
     }
-    activePair = fresh;
-    entryPrice = freshPrice;
-    entryLiquidity = pairLiquidityUsd(fresh);
+    // V4 hook gate (EVM 64-hex poolIds): a nonzero hook can tax, gate or
+    // brick the exit. Unrecovered keys pass lenient (manager unconfigured).
+    if (config.safety.enabled && /^0x[0-9a-fA-F]{64}$/.test(pending.pairAddress)) {
+      const hookVerdict = assessV4Hooks(
+        await recoverV4PoolKey(pending.chain, pending.pairAddress as `0x${string}`),
+        config.safety.strict,
+      );
+      if (!hookVerdict.ok) {
+        log(`⏭️ skip entry ${pending.chain}:${pending.pairAddress}: token safety (${hookVerdict.reason})`);
+        continue;
+      }
+    }
+    // Executable-quote probe: abort on a stale mark (deviation) or a
+    // reverting EVM exit simulation (honeypot exit). Unquotable just logs.
+    if (config.safety.enabled) {
+      const probe = await probeEntryQuote(pending.chain, fresh, freshPrice, pending.sizeUsd);
+      if (probe.deviationPct !== null && probe.deviationPct > config.safety.quoteDeviationPct) {
+        log(`⏭️ skip entry ${pending.chain}:${pending.pairAddress}: executable quote deviated ${probe.deviationPct.toFixed(1)}% > ${config.safety.quoteDeviationPct}%`);
+        continue;
+      }
+      if (probe.sellSimReverted) {
+        log(`⏭️ skip entry ${pending.chain}:${pending.pairAddress}: exit simulation reverts (unexitable)`);
+        continue;
+      }
+    }
+    await openEntry({
+      chain: pending.chain,
+      poolAddress: pending.poolAddress,
+      poolCreatedAtMs: pending.poolCreatedAt,
+      activePair: fresh,
+      entryPrice: freshPrice,
+      entryLiquidity: pairLiquidityUsd(fresh),
+      sizeUsd: pending.sizeUsd,
+    });
   }
+}
 
+/**
+ * Pre-entry executable-quote probe (best-effort, never throws). Compares a
+ * real BUY quote against the DexScreener mark and runs a dust SELL
+ * simulation on EVM. Unquotable or unreadable → unchecked (allow + log);
+ * only a measured deviation or an explicit revert blocks the entry.
+ */
+async function probeEntryQuote(
+  chain: string,
+  pair: DexScreenerPair,
+  markPriceUsd: number,
+  sizeUsd: number,
+): Promise<{ deviationPct: number | null; sellSimReverted: boolean }> {
+  const unchecked = { deviationPct: null, sellSimReverted: false };
+  try {
+    const priceNative = Number(pair.priceNative ?? "NaN");
+    const qp = quotePriceUsd(markPriceUsd, priceNative, pair.quoteToken.symbol);
+    const qd = KNOWN_QUOTE_DECIMALS[pair.quoteToken.symbol.toLowerCase()];
+    if (qp === null || qd === undefined || !Number.isFinite(priceNative) || priceNative <= 0) {
+      return unchecked;
+    }
+    const chainId = EVM_CHAIN_IDS[chain];
+    const base = {
+      chain,
+      ...(chainId !== undefined ? { chainId } : {}),
+      pairAddress: pair.pairAddress,
+      taker: simTakerFor(chain),
+      slippageBps: 100,
+    };
+    const buy = await simulateSwap({
+      ...base,
+      side: "BUY",
+      sellToken: pair.quoteToken.address,
+      buyToken: pair.baseToken.address,
+      sellAmountBaseUnits: qtyToBaseUnits(sizeUsd / qp, qd),
+      sellDecimals: qd,
+      buyDecimals: null,
+    });
+    let deviationPct: number | null = null;
+    const tokenDec = await resolveTokenDecimals(chain, pair.baseToken.address);
+    if (buy.attempted && tokenDec !== null) {
+      deviationPct = quoteDeviationPct(1 / priceNative, buy.quotedBuyAmount, buy.quotedSellAmount, tokenDec, qd);
+    }
+    // Dust exit simulation: a reverting $1 sell means the entry is a trap.
+    // No-calldata routes (V4-direct) report simOk null → not a revert.
+    let sellSimReverted = false;
+    if (chainId !== undefined && tokenDec !== null) {
+      const dust = await simulateSwap({
+        ...base,
+        side: "SELL",
+        sellToken: pair.baseToken.address,
+        buyToken: pair.quoteToken.address,
+        sellAmountBaseUnits: qtyToBaseUnits(1 / markPriceUsd, tokenDec),
+        sellDecimals: tokenDec,
+        buyDecimals: qd,
+      });
+      sellSimReverted = dust.attempted && dust.simOk === false;
+    }
+    return { deviationPct, sellSimReverted };
+  } catch {
+    return unchecked;
+  }
+}
+
+/**
+ * Open a paper position after all gates pass. Shared by the immediate
+ * (confirm-disabled) path and the deferred confirm worker.
+ */
+async function openEntry(args: {
+  chain: string;
+  poolAddress: string;
+  poolCreatedAtMs: number;
+  activePair: DexScreenerPair;
+  entryPrice: number;
+  entryLiquidity: number;
+  sizeUsd: number;
+}): Promise<void> {
+  const { chain, poolAddress, activePair, entryPrice, entryLiquidity, sizeUsd } = args;
   const positionId = `${chain}:${activePair.pairAddress}`;
   if (positions.has(positionId)) return;
   if (config.entry.oneEntryPerPool && portfolio.closedTrades.some((t) => t.id === positionId)) {
     log(`⏭️ skip re-entry ${positionId}: already traded (ONE_ENTRY_PER_POOL)`);
     return;
   }
+  // Age is gated at discovery, but the confirm delay + re-quote means the
+  // FILL can land past NEW_POOL_MAX_AGE_SEC (observed up to ~124s against
+  // a 120s cap). Enforce the band at fill so the sample stays in-regime.
+  const ageSec = ageSeconds(args.poolCreatedAtMs);
+  if (ageSec > config.dexPaprika.maxAgeSec) {
+    log(`⏭️ skip entry ${positionId}: age ${ageSec.toFixed(0)}s exceeds NEW_POOL_MAX_AGE_SEC=${config.dexPaprika.maxAgeSec}s at fill`);
+    return;
+  }
+  if (positions.size >= config.entry.maxOpenPositions) {
+    log(`⏭️ skip entry ${positionId}: position cap reached (${positions.size}/${config.entry.maxOpenPositions})`);
+    return;
+  }
+  const entryToken = chooseCandidateToken(activePair);
+  // Per-chain cap bounds simultaneous total loss on one chain.
+  const chainCap = config.risk.chainCaps.get(chain);
+  if (chainCap !== undefined && openCountForChain(chain) >= chainCap) {
+    log(`⏭️ skip entry ${positionId}: chain cap reached (${openCountForChain(chain)}/${chainCap} on ${chain})`);
+    return;
+  }
+  // Same-symbol cluster cap: copycat tickers and same-name pools on
+  // different pairs count as one exposure.
+  let sameSymbol = 0;
+  for (const p of positions.values()) {
+    if (p.status === "OPEN" && p.chain === chain && p.symbol === entryToken.symbol) {
+      sameSymbol += 1;
+    }
+  }
+  if (sameSymbol >= config.risk.maxSameSymbolOpen) {
+    log(`⏭️ skip entry ${positionId}: symbol cluster cap reached (${sameSymbol} open ${entryToken.symbol} on ${chain})`);
+    return;
+  }
 
   const balanceBefore = portfolio.equityUsd(positions.values());
-  if (!portfolio.canOpen(sizeUsd)) {
+  // Single atomic reserve: onOpen returns false when cash is insufficient.
+  if (!portfolio.onOpen(sizeUsd)) {
     log(`⚠️ skip entry ${positionId}: insufficient cash $${portfolio.cashUsd.toFixed(2)}`);
     return;
   }
 
-  const entryToken = chooseCandidateToken(activePair);
   const position = openPosition({
     id: positionId,
     chain,
@@ -476,11 +816,12 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
     marketPrice: entryPrice,
     usdSize: sizeUsd,
     balanceBeforeUsd: balanceBefore,
-    poolAddress: pool.poolAddress,
+    poolAddress,
     entryLiquidityUsd: entryLiquidity,
-    entryAgeSec: ageSeconds(pool.createdAtMs),
+    entryAgeSec: ageSeconds(args.poolCreatedAtMs),
+    // Per-chain exit regime snapshot (undefined = global config behavior).
+    exitProfile: resolveExitProfile(chain),
   });
-  portfolio.onOpen(sizeUsd);
 
   positions.set(positionId, position);
   // Fee/slippage baseline for incremental per-fill attribution. The fee
@@ -550,11 +891,29 @@ async function discover(): Promise<void> {
   }
 
   pruneSeenPools();
-  pruneCandidates();
-  log(`🔎 discovery cycle complete in ${Date.now() - started}ms; seen=${seenPools.size} candidates=${candidates.size}`);
+  checkLedgerHealthThrottled();
+  log(`🔎 discovery cycle complete in ${Date.now() - started}ms; seen=${seenPools.size} pendingConfirm=${pendingConfirms.size}`);
+}
+
+let lastLedgerWarnMs = 0;
+
+/**
+ * Ledger writes are best-effort and fail silently by design, so surface an
+ * unhealthy ledger here (hourly at most) instead of discovering gaps in the
+ * DuckDB file weeks later during analysis.
+ */
+function checkLedgerHealthThrottled(): void {
+  if (!config.analytics.enabled) return;
+  const status = analyticsStatus();
+  if (status.startsWith("ready") || status === "disabled") return;
+  const now = Date.now();
+  if (now - lastLedgerWarnMs < 3_600_000) return;
+  lastLedgerWarnMs = now;
+  log(`⚠️ analytics ledger unhealthy (${status}) — trading continues, ledger gaps possible`);
 }
 
 function pruneSeenPools(): void {
+  // Amortized cleanup: linear scan every cycle, full sort only past the cap.
   const cutoff = Date.now() - 6 * 60 * 60_000;
   for (const [key, timestamp] of seenPools) {
     if (timestamp < cutoff) seenPools.delete(key);
@@ -563,19 +922,6 @@ function pruneSeenPools(): void {
     const entries = [...seenPools.entries()].sort((a, b) => a[1] - b[1]);
     for (const [key] of entries.slice(0, Math.floor(entries.length / 2))) {
       seenPools.delete(key);
-    }
-  }
-}
-
-function pruneCandidates(): void {
-  const cutoff = Date.now() - 6 * 60 * 60_000;
-  for (const [key, candidate] of candidates) {
-    if (candidate.discoveredAt < cutoff) candidates.delete(key);
-  }
-  if (candidates.size > 20_000) {
-    const entries = [...candidates.entries()].sort((a, b) => a[1].discoveredAt - b[1].discoveredAt);
-    for (const [key] of entries.slice(0, Math.floor(entries.length / 2))) {
-      candidates.delete(key);
     }
   }
 }
@@ -598,15 +944,56 @@ async function trackPositions(): Promise<void> {
       // like discovery does, so a price update is never missed on casing.
       const pairMap = new Map(pairs.map((pair) => [pair.pairAddress.toLowerCase(), pair]));
 
-      for (const position of [...positions.values()].filter((p) => p.chain === chain)) {
-        if (position.status !== "OPEN") continue;
+      // Positions on this chain update concurrently (cap 5): each task stays
+      // sequential per position (state → persist → reporting order kept),
+      // but a slow quote-check or Telegram send on one position no longer
+      // stalls the rest of the tick past the 1s poll budget.
+      const tasks = [...positions.values()]
+        .filter((p) => p.chain === chain)
+        .map((position) => () => trackOnePosition(position, pairMap.get(position.pairAddress.toLowerCase())));
+      await runWithLimit(tasks, PRICE_TRACK_CONCURRENCY);
+    } catch (error) {
+      log(`⚠️ price ${chain}: ${String(error)}`);
+    }
+  }
 
-        const pair = pairMap.get(position.pairAddress.toLowerCase());
-        if (!pair) continue;
-        const price = parsePrice(pair);
-        if (price === null) continue;
+  // Throttled save: keeps trailing-high / price progress fresh on disk
+  // even when no fill or exit events fired this cycle.
+  persist(false);
+}
 
-        const events = updatePosition(position, price);
+/** Max concurrent per-position updates within one price tick. */
+const PRICE_TRACK_CONCURRENCY = 5;
+
+/** Run async tasks with at most `limit` in flight. Completion order varies. */
+async function runWithLimit(tasks: Array<() => Promise<void>>, limit: number): Promise<void> {
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(Math.max(1, limit), Math.max(1, tasks.length)) },
+    async () => {
+      while (next < tasks.length) {
+        const task = tasks[next++]!;
+        await task();
+      }
+    },
+  );
+  await Promise.all(workers);
+}
+
+/**
+ * Update one position from its latest DexScreener print: TP fills, stop
+ * transitions and exits (state → persist → reporting, in that order), then
+ * the research snapshot and the closed-without-event safety net.
+ */
+async function trackOnePosition(position: Position, pair: DexScreenerPair | undefined): Promise<void> {
+  if (position.status !== "OPEN") return;
+  if (!pair) return;
+  const price = parsePrice(pair);
+  if (price === null) return;
+
+        const events = updatePosition(position, price, Date.now(), {
+          liquidityUsd: pairLiquidityUsd(pair),
+        });
         for (const event of events) {
           log(
             `⚡ ${position.symbol} ${event.type} price=$${price.toPrecision(8)} ` +
@@ -679,6 +1066,7 @@ async function trackPositions(): Promise<void> {
             case "STOP_EXIT":
             case "EARLY_EXIT":
             case "BREAKEVEN_EXIT":
+            case "DRAIN_EXIT":
             case "TIME_EXIT": {
               // State mutation first: proceeds, close record, removal and
               // persist all happen before any fallible reporting, so a
@@ -780,15 +1168,6 @@ async function trackPositions(): Promise<void> {
           lastSnapshotAt.delete(position.id);
           persist(true);
         }
-      }
-    } catch (error) {
-      log(`⚠️ price ${chain}: ${String(error)}`);
-    }
-  }
-
-  // Throttled save: keeps trailing-high / price progress fresh on disk
-  // even when no fill or exit events fired this cycle.
-  persist(false);
 }
 
 async function runLoop(label: string, intervalMs: number, task: () => Promise<void>): Promise<never> {
@@ -803,6 +1182,9 @@ async function runLoop(label: string, intervalMs: number, task: () => Promise<vo
 }
 
 async function main(): Promise<void> {
+  // Single-instance guard first: a second process sharing state.json and
+  // paper.duckdb silently corrupts both (cash jumps, ledger lock losses).
+  claimInstanceLockForStateFile(config.recovery.stateFile);
   console.log("============================================");
   console.log(" Multi-Chain New Pair Paper Trading Bot");
   console.log("============================================");
@@ -850,6 +1232,7 @@ async function main(): Promise<void> {
   }
 
   restore();
+  await reconcileLedgerWithState();
 
   // Live reconciliation (no-op unless LIVE_TRADING_ENABLED=true): restores
   // the kill switch, reloads journals, and resolves every open live order
@@ -881,6 +1264,13 @@ async function main(): Promise<void> {
   await Promise.all([
     runLoop("discovery", config.dexPaprika.intervalMs, discover),
     runLoop("price-tracker", config.dexScreener.intervalMs, trackPositions),
+    // Deferred entry-confirm worker: fires queued re-quotes ~ENTRY_CONFIRM_DELAY_MS
+    // after queueing. Runs every second so confirms don't wait for the 40s
+    // discovery cadence and blow the 60–120s entry age band.
+    runLoop("confirm", 1_000, fireDueConfirms),
+    // Live exit manager: background execution with retry + sweeper, off the
+    // price-tracker tick. No-op unless LIVE_TRADING_ENABLED=true.
+    runLoop("live-sells", 2_000, () => pumpLiveSells({ notify, log }, positions)),
   ]);
 }
 

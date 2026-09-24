@@ -6,6 +6,7 @@ import type {
   SwapExecutor,
 } from "../types.ts";
 import { requireLive } from "../types.ts";
+import { keccak256, parseAbiItem, toHex } from "viem";
 import {
   getEvmPublicClient,
   getEvmTokenDecimals,
@@ -25,10 +26,15 @@ import {
  * trickery) and applies exact single-tick constant-price math in BigInt:
  * the quote is exact while the swap stays inside the current tick, which
  * holds for the bot's small diagnostic sizes. Within-tick price movement
- * is NOT modeled — priceImpactPct is the fee drag only — and calldata is
- * never built (that needs the full PoolKey: fee, tickSpacing, hooks, which
- * cannot be recovered from a poolId), so eth_call simulation stays
- * unavailable and simOk remains null downstream, exactly like Jupiter.
+ * is NOT modeled — priceImpactPct is the fee drag only.
+ *
+ * The full PoolKey (fee, tickSpacing, hooks) IS recoverable from the
+ * PoolManager Initialize event (topic1 = poolId carries it; see
+ * recoverV4PoolKey below), so quotes attach it best-effort when the
+ * chain's PoolManager is configured. Executable calldata is still not
+ * built — that needs UniversalRouter/V4Router encoding on top of the key —
+ * so eth_call simulation stays unavailable and simOk remains null
+ * downstream, exactly like Jupiter.
  *
  * Fee math follows v4-core ProtocolFeeLibrary exactly: the direction's
  * 12-bit protocol fee plus the LP fee, minus their cross term, all in pips
@@ -205,6 +211,9 @@ export async function quoteV4Direct(params: V4DirectQuoteParams): Promise<Quote>
   }
   // Single-tick model: execution deviates from spot by the fee drag only.
   const priceImpactPct = Number(feePips) / 10_000;
+  // Best-effort PoolKey enrichment for downstream sell-simulation work.
+  // Cached after first recovery; never fails the quote.
+  const poolKey = await recoverV4PoolKey(params.chain, params.poolId);
   return {
     source: "uniswap-v4",
     chain: params.chain,
@@ -227,14 +236,16 @@ export async function quoteV4Direct(params: V4DirectQuoteParams): Promise<Quote>
       swapFeePips: feePips.toString(),
       zeroForOne,
       singleTick: true,
+      ...(poolKey ? { poolKey } : {}),
     },
   };
 }
 
 /**
  * Direct-V4 executor, constructed per candidate pool with the V4 poolId
- * (64 hex) that discovery stores as pairAddress. No calldata is ever
- * produced (needs the full PoolKey) — quotes only, like Jupiter.
+ * (64 hex) that discovery stores as pairAddress. Quotes only for now:
+ * executable calldata needs UniversalRouter/V4Router encoding on top of
+ * the recovered PoolKey (see recoverV4PoolKey) — not built yet.
  */
 export class UniswapV4DirectExecutor implements SwapExecutor {
   readonly name = "uniswap-v4";
@@ -273,19 +284,173 @@ export class UniswapV4DirectExecutor implements SwapExecutor {
   }
 
   async simulate(): Promise<SimulationResult> {
-    throw new Error("Uniswap V4 adapter has no native simulate: quotes carry no calldata (no PoolKey)");
+    throw new Error("Uniswap V4 adapter has no native simulate yet: quotes carry no calldata (UniversalRouter encoding on the recovered PoolKey is still TODO)");
   }
 
   async buy(): Promise<ExecutionResult> {
     requireLive("Uniswap V4 buy");
-    // V4-direct quotes carry no calldata (no PoolKey) — execution must go
-    // through 0x, which abstracts the pool key away. Refuse loudly rather
-    // than guessing.
-    throw new Error("Uniswap V4 has no executable calldata: route V4 execution through 0x (ZeroExExecutor)");
+    // Execution must still go through 0x, which abstracts the pool key
+    // away — direct calldata is not built yet. Refuse loudly rather than
+    // guessing.
+    throw new Error("Uniswap V4 has no executable calldata yet: route V4 execution through 0x (ZeroExExecutor)");
   }
 
   async sell(): Promise<ExecutionResult> {
     requireLive("Uniswap V4 sell");
-    throw new Error("Uniswap V4 has no executable calldata: route V4 execution through 0x (ZeroExExecutor)");
+    throw new Error("Uniswap V4 has no executable calldata yet: route V4 execution through 0x (ZeroExExecutor)");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PoolKey recovery from the PoolManager Initialize event.
+//
+// IPoolManager (v4-core): Initialize(PoolId indexed id, Currency indexed
+// currency0, Currency indexed currency1, uint24 fee, int24 tickSpacing,
+// IHooks hooks, uint160 sqrtPriceX96, int24 tick). Filtering the
+// PoolManager's logs by topic0 + topic1=poolId recovers the full key that
+// the poolId hash alone cannot reveal — the prerequisite for sell
+// simulation and direct (aggregator-free) execution.
+// ---------------------------------------------------------------------------
+
+/** Canonical topic0, computed at runtime so no constant can drift. */
+export const V4_INITIALIZE_TOPIC0 = keccak256(
+  toHex("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)"),
+);
+
+/** Typed Initialize event for log decoding (topic0 above is its hash). */
+const V4_INITIALIZE_EVENT = parseAbiItem(
+  "event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)",
+);
+
+export interface V4PoolKey {
+  currency0: `0x${string}`;
+  currency1: `0x${string}`;
+  fee: number;
+  tickSpacing: number;
+  hooks: `0x${string}`;
+}
+
+/**
+ * PoolManager contract per chain. Only deployments confirmed from primary
+ * sources are built in (base + arbitrum below); everything else — including
+ * Robinhood Chain — comes from UNISWAP_V4_POOL_MANAGERS JSON overrides.
+ * Never guess an address: a wrong manager silently yields "no key".
+ */
+const V4_POOL_MANAGERS: Record<string, `0x${string}`> = {
+  base: "0x498581fF718922c3f8e6A244956aF099B2652b2b",
+  arbitrum: "0x360E68faCcca8cA495c1B759Fd9EEe466db9FB32",
+};
+
+export function v4PoolManagerFor(chain: string): `0x${string}` | null {
+  try {
+    const overrides: unknown = JSON.parse(process.env.UNISWAP_V4_POOL_MANAGERS ?? "{}");
+    const custom = (overrides as Record<string, unknown>)[chain];
+    if (typeof custom === "string" && /^0x[0-9a-fA-F]{40}$/.test(custom)) {
+      return custom as `0x${string}`;
+    }
+  } catch {
+    // Malformed override JSON falls through to the built-in map.
+  }
+  return V4_POOL_MANAGERS[chain] ?? null;
+}
+
+function topicAddress(topic: string): `0x${string}` | null {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(topic)) return null;
+  return `0x${topic.slice(-40)}` as `0x${string}`;
+}
+
+/**
+ * Pure: decode a PoolKey from one Initialize log. Returns null for any
+ * other event or malformed payload — callers scan logs and keep the first
+ * hit. Unit-tested with synthetic logs (no network).
+ */
+export function parseV4InitializeLog(log: {
+  topics: Array<string | undefined | null>;
+  data: string;
+}): V4PoolKey | null {
+  const [t0, , t2, t3] = log.topics ?? [];
+  if (!t0 || t0.toLowerCase() !== V4_INITIALIZE_TOPIC0) return null;
+  const currency0 = t2 ? topicAddress(t2) : null;
+  const currency1 = t3 ? topicAddress(t3) : null;
+  if (!currency0 || !currency1) return null;
+  // Non-indexed data: fee(uint24) | tickSpacing(int24) | hooks(address) |
+  // sqrtPriceX96(uint160) | tick(int24) — five 32-byte words.
+  const data = log.data.startsWith("0x") ? log.data.slice(2) : log.data;
+  if (data.length < 320) return null;
+  const fee = Number(BigInt(`0x${data.slice(0, 64)}`));
+  let tickSpacing = Number(BigInt(`0x${data.slice(64, 128)}`));
+  if (tickSpacing >= 2 ** 23) tickSpacing -= 2 ** 24; // int24 two's complement
+  const hooks = `0x${data.slice(128, 192).slice(-40)}` as `0x${string}`;
+  if (!Number.isFinite(fee) || fee < 0 || !Number.isFinite(tickSpacing)) return null;
+  return { currency0, currency1, fee, tickSpacing, hooks };
+}
+
+// Initialize events are immutable, so recovered keys cache forever.
+// Bounded: one entry per quoted pool, evicted FIFO past the cap.
+const poolKeyCache = new Map<string, V4PoolKey>();
+const POOL_KEY_CACHE_CAP = 5_000;
+
+/**
+ * Best-effort PoolKey recovery for a poolId. Returns null when the chain
+ * has no configured PoolManager, the RPC cannot serve the log range, or no
+ * Initialize event exists in the lookback window. Never throws — quoting
+ * proceeds without the key exactly as before.
+ */
+export async function recoverV4PoolKey(
+  chain: string,
+  poolId: `0x${string}`,
+): Promise<V4PoolKey | null> {
+  const cacheKey = `${chain}:${poolId.toLowerCase()}`;
+  const cached = poolKeyCache.get(cacheKey);
+  if (cached) return cached;
+  const manager = v4PoolManagerFor(chain);
+  if (!manager) return null;
+  try {
+    const client = getEvmPublicClient(chain);
+    const latest = await client.getBlockNumber();
+    // Fresh pools initialized recently; bounded for range-limited RPCs.
+    const lookback = 200_000n;
+    const fromBlock = latest > lookback ? latest - lookback : 0n;
+    const logs = await client.getContractEvents({
+      address: manager,
+      abi: [V4_INITIALIZE_EVENT],
+      eventName: "Initialize",
+      args: { id: poolId },
+      fromBlock,
+      toBlock: latest,
+    });
+    for (const log of logs) {
+      const a = (log.args ?? {}) as {
+        currency0?: unknown;
+        currency1?: unknown;
+        fee?: unknown;
+        tickSpacing?: unknown;
+        hooks?: unknown;
+      };
+      // Decoded ages are numbers/bigints per ABI; validate shapes, never cast blindly.
+      const c0 = typeof a.currency0 === "string" ? a.currency0 : "";
+      const c1 = typeof a.currency1 === "string" ? a.currency1 : "";
+      const hooks = typeof a.hooks === "string" ? a.hooks : "";
+      const fee = typeof a.fee === "number" ? a.fee : Number(a.fee as bigint);
+      const spacing = typeof a.tickSpacing === "number" ? a.tickSpacing : Number(a.tickSpacing as bigint);
+      if (!/^0x[0-9a-fA-F]{40}$/.test(c0) || !/^0x[0-9a-fA-F]{40}$/.test(c1)) continue;
+      if (!/^0x[0-9a-fA-F]{40}$/.test(hooks)) continue;
+      if (!Number.isFinite(fee) || fee < 0 || !Number.isFinite(spacing)) continue;
+      const key: V4PoolKey = {
+        currency0: c0 as `0x${string}`,
+        currency1: c1 as `0x${string}`,
+        fee,
+        tickSpacing: spacing,
+        hooks: hooks as `0x${string}`,
+      };
+      if (poolKeyCache.size >= POOL_KEY_CACHE_CAP) {
+        poolKeyCache.delete(poolKeyCache.keys().next().value!);
+      }
+      poolKeyCache.set(cacheKey, key);
+      return key;
+    }
+    return null;
+  } catch {
+    return null;
   }
 }

@@ -35,11 +35,19 @@ export const KNOWN_QUOTE_DECIMALS: Record<string, number> = {
 /** Zero address: eth_call simulation sender when no trader is configured. */
 export const SIM_ZERO_TAKER = "0x0000000000000000000000000000000000000000";
 
-/** Lenient observation policy: we record deviations, we don't gate entries. */
+/** Observation policy: we record deviations, we don't gate entries.
+ * Impact/tax bounds are set where legitimate $5–10 fills in $15k+ pools
+ * always pass (<1% impact): anything breaching them is worth a ledger note,
+ * and live buys refuse on riskPass. Unknown venue fields still warn rather
+ * than block — a fresh pool's first quotable route often reports no impact
+ * figure, and blocking on unknown would reject everything during price
+ * discovery. (EVM transfer-tax unknowns remain a known gap: blocking them
+ * needs sell-simulation plumbing so a passing sim can vouch for the exit.)
+ */
 export const SIM_RISK_POLICY: RiskPolicy = {
-  maxPriceImpactPct: 25,
-  maxBuyTaxBps: 1000,
-  maxSellTaxBps: 1000,
+  maxPriceImpactPct: 2,
+  maxBuyTaxBps: 500,
+  maxSellTaxBps: 500,
 };
 
 /** Exact USD → base units without float error above cents precision. */

@@ -1,43 +1,21 @@
 import { config } from "./config.ts";
+import { SlidingWindowRateLimiter } from "./rate-limiter.ts";
 import type { DexScreenerPair } from "./types.ts";
 
 interface PairResponse {
   pairs?: DexScreenerPair[] | null;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-class SlidingWindowRateLimiter {
-  private readonly timestamps: number[] = [];
-
-  constructor(private readonly maxPerMinute: number) {}
-
-  async acquire(): Promise<void> {
-    while (true) {
-      const now = Date.now();
-      const cutoff = now - 60_000;
-      while (this.timestamps.length > 0 && this.timestamps[0]! <= cutoff) {
-        this.timestamps.shift();
-      }
-
-      if (this.timestamps.length < this.maxPerMinute) {
-        this.timestamps.push(now);
-        return;
-      }
-
-      const oldest = this.timestamps[0]!;
-      await sleep(Math.max(25, oldest + 60_000 - now + 5));
-    }
-  }
-}
-
 const limiter = new SlidingWindowRateLimiter(config.dexScreener.maxRpm);
 
 async function getJson<T>(url: URL): Promise<T> {
   await limiter.acquire();
-  const response = await fetch(url, { headers: { accept: "application/json" } });
+  // Bounded: a hung DexScreener socket must never stall the price tracker
+  // or the confirm worker past one poll interval.
+  const response = await fetch(url, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(15_000),
+  });
   if (response.status === 429) throw new Error("DexScreener HTTP 429 rate limit");
   if (!response.ok) throw new Error(`DexScreener HTTP ${response.status}`);
   return await response.json() as T;

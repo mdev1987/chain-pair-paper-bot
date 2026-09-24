@@ -21,8 +21,14 @@ export function splitMessage(text: string): string[] {
         chunks.push(current);
         current = "";
       }
-      chunks.push(rest.slice(0, MAX_MESSAGE_CHARS));
-      rest = rest.slice(MAX_MESSAGE_CHARS);
+      let cut = MAX_MESSAGE_CHARS;
+      // Never split a MarkdownV2 escape sequence: a chunk ending in a lone
+      // backslash would unescape the next chunk's first char and fail the
+      // whole send with a parse error.
+      const trailing = rest.slice(0, cut).match(/\\+$/)?.[0].length ?? 0;
+      if (trailing % 2 === 1) cut -= 1;
+      chunks.push(rest.slice(0, cut));
+      rest = rest.slice(cut);
     }
     const candidate = current ? `${current}\n${rest}` : rest;
     if (candidate.length > MAX_MESSAGE_CHARS && current) {

@@ -15,6 +15,11 @@ export interface LiveOrder {
   positionId: string;
   chain: string;
   side: "BUY" | "SELL";
+  /**
+   * Fill label distinguishing multiple sells per position ("TP1", "EXIT").
+   * Absent on older orders and one-shot flows (live test) — treated as "".
+   */
+  label?: string;
   status: LiveOrderStatus;
   /** On-chain signature once submitted; null while still a signal. */
   signature: string | null;
@@ -55,6 +60,7 @@ function isLiveOrder(value: unknown): value is LiveOrder {
     o.positionId.length > 0 &&
     typeof o.chain === "string" &&
     (o.side === "BUY" || o.side === "SELL") &&
+    (o.label === undefined || typeof o.label === "string") &&
     (o.status === "SIGNAL" ||
       o.status === "SUBMITTED" ||
       o.status === "CONFIRMED" ||
@@ -104,14 +110,17 @@ function transition(
   patch: Partial<LiveOrder> = {},
 ): LiveOrder[] {
   const now = Date.now();
-  const idx = orders.findIndex((o) => o.positionId === positionId && o.side === side);
+  const label = patch.label ?? "";
+  const idx = orders.findIndex(
+    (o) => o.positionId === positionId && o.side === side && (o.label ?? "") === label,
+  );
   if (idx === -1) {
     // Fresh journal entry. Only SIGNAL may be created from nothing —
     // anything else means the caller lost track of an order (fail closed).
     if (to !== "SIGNAL") {
       throw new Error(`No ${side} order for ${positionId}: cannot transition to ${to}`);
     }
-    return [...orders, { positionId, chain: patch.chain ?? "", side, status: to, signature: null, createdAt: now, updatedAt: now, ...patch }];
+    return [...orders, { positionId, chain: patch.chain ?? "", side, label, status: to, signature: null, createdAt: now, updatedAt: now, ...patch }];
   }
   const current = orders[idx]!;
   if (!TRANSITIONS[current.status].includes(to)) {
@@ -128,11 +137,13 @@ export function recordSignal(
     positionId: string;
     chain: string;
     side: "BUY" | "SELL";
+    label?: string;
     meta?: LiveOrder["meta"];
   },
 ): LiveOrder[] {
   return transition(orders, input.positionId, input.side, "SIGNAL", {
     chain: input.chain,
+    ...(input.label !== undefined ? { label: input.label } : {}),
     ...(input.meta !== undefined ? { meta: input.meta } : {}),
   });
 }
@@ -142,17 +153,19 @@ export function markSubmitted(
   positionId: string,
   side: "BUY" | "SELL",
   signature: string,
+  label = "",
 ): LiveOrder[] {
   if (!signature) throw new Error("markSubmitted needs the on-chain signature");
-  return transition(orders, positionId, side, "SUBMITTED", { signature });
+  return transition(orders, positionId, side, "SUBMITTED", { signature, label });
 }
 
 export function markConfirmed(
   orders: LiveOrder[],
   positionId: string,
   side: "BUY" | "SELL",
+  label = "",
 ): LiveOrder[] {
-  return transition(orders, positionId, side, "CONFIRMED");
+  return transition(orders, positionId, side, "CONFIRMED", { label });
 }
 
 export function markFailed(
@@ -160,6 +173,38 @@ export function markFailed(
   positionId: string,
   side: "BUY" | "SELL",
   note: string,
+  label = "",
 ): LiveOrder[] {
-  return transition(orders, positionId, side, "FAILED", { note });
+  return transition(orders, positionId, side, "FAILED", { note, label });
+}
+
+/**
+ * Reopen a terminal FAILED order as a fresh SIGNAL for the exit manager's
+ * retry loop (boot catch-up after a crash mid-execute). Only FAILED orders
+ * reopen — every other state keeps its terminality.
+ */
+export function retrySignal(
+  orders: LiveOrder[],
+  positionId: string,
+  side: "BUY" | "SELL",
+  label = "",
+  note = "",
+): LiveOrder[] {
+  const idx = orders.findIndex(
+    (o) => o.positionId === positionId && o.side === side && (o.label ?? "") === label,
+  );
+  if (idx === -1) throw new Error(`No ${side} order for ${positionId}: cannot retry`);
+  const current = orders[idx]!;
+  if (current.status !== "FAILED") {
+    throw new Error(`Only FAILED orders can retry (is ${current.status}) for ${positionId}`);
+  }
+  const next = [...orders];
+  next[idx] = {
+    ...current,
+    status: "SIGNAL",
+    signature: null,
+    updatedAt: Date.now(),
+    ...(note ? { note } : {}),
+  };
+  return next;
 }

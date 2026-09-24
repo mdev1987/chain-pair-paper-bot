@@ -14,6 +14,14 @@ import { dirname } from "node:path";
 let dailyLossUsd = 0;
 let halted = false;
 let liveOpenCount = 0;
+/**
+ * Net realized live PnL for the UTC day (gains offset losses) and the live
+ * open cost basis. The halt binds the tail two ways: realized net past the
+ * limit, or realized net minus open exposure past the limit (stuck bags
+ * assumed worthless — the simultaneous-total-loss bound).
+ */
+let dailyNetPnlUsd = 0;
+let liveOpenExposureUsd = 0;
 let lossDay = todayUtc();
 const pendingOrders = new Set<string>();
 
@@ -29,24 +37,40 @@ export function dailyLossLimitUsd(): number {
 }
 
 export const liveState = {
+  /** Gross loss view (compat): net losses floored at zero. */
   get dailyLossUsd(): number {
-    return dailyLossUsd;
+    return Math.max(0, -dailyNetPnlUsd);
+  },
+  /** Net realized live PnL today (negative = losing). */
+  get dailyNetPnlUsd(): number {
+    return dailyNetPnlUsd;
   },
   get liveOpenCount(): number {
     return liveOpenCount;
   },
+  get liveOpenExposureUsd(): number {
+    return liveOpenExposureUsd;
+  },
   isHalted(): boolean {
-    return halted || dailyLossUsd >= dailyLossLimitUsd();
+    const limit = dailyLossLimitUsd();
+    return (
+      halted ||
+      dailyNetPnlUsd <= -limit ||
+      dailyNetPnlUsd - liveOpenExposureUsd <= -limit
+    );
   },
   halt(reason: string): void {
     halted = true;
     console.log(`🛑 live entries halted: ${reason}`);
   },
   recordRealizedPnl(pnlUsd: number): void {
-    if (Number.isFinite(pnlUsd) && pnlUsd < 0) dailyLossUsd += -pnlUsd;
+    if (Number.isFinite(pnlUsd)) dailyNetPnlUsd += pnlUsd;
   },
   setLiveOpenCount(n: number): void {
     liveOpenCount = n;
+  },
+  setLiveOpenExposureUsd(usd: number): void {
+    if (Number.isFinite(usd) && usd >= 0) liveOpenExposureUsd = usd;
   },
   addPending(positionId: string): void {
     pendingOrders.add(positionId);
@@ -64,6 +88,8 @@ export const liveState = {
   /** Tests only — production state is append-only within a process. */
   resetForTests(): void {
     dailyLossUsd = 0;
+    dailyNetPnlUsd = 0;
+    liveOpenExposureUsd = 0;
     halted = false;
     liveOpenCount = 0;
     lossDay = todayUtc();
@@ -83,7 +109,10 @@ interface LiveStateFile {
   version: number;
   savedAt: number;
   lossDay: string;
+  /** Legacy gross-loss field, still written for old readers. */
   dailyLossUsd: number;
+  /** Net realized PnL today; preferred on restore. */
+  dailyNetPnlUsd: number;
   halted: boolean;
 }
 
@@ -94,7 +123,8 @@ export function persistLiveState(path: string = defaultLiveStatePath()): void {
     version: 1,
     savedAt: Date.now(),
     lossDay,
-    dailyLossUsd,
+    dailyLossUsd: Math.max(0, -dailyNetPnlUsd),
+    dailyNetPnlUsd,
     halted,
   };
   const tmp = `${path}.tmp`;
@@ -117,14 +147,19 @@ export function restoreLiveState(path: string = defaultLiveStatePath()): void {
     const losses = typeof parsed.dailyLossUsd === "number" && Number.isFinite(parsed.dailyLossUsd) && parsed.dailyLossUsd >= 0
       ? parsed.dailyLossUsd
       : 0;
+    // Prefer the net field; pre-net ledgers only have gross losses.
+    const net = typeof parsed.dailyNetPnlUsd === "number" && Number.isFinite(parsed.dailyNetPnlUsd)
+      ? parsed.dailyNetPnlUsd
+      : -losses;
     const day = typeof parsed.lossDay === "string" ? parsed.lossDay : todayUtc();
     if (day !== todayUtc()) {
-      dailyLossUsd = 0;
+      dailyNetPnlUsd = 0;
       lossDay = todayUtc();
     } else {
-      dailyLossUsd = losses;
+      dailyNetPnlUsd = net;
       lossDay = day;
     }
+    dailyLossUsd = Math.max(0, -dailyNetPnlUsd);
     halted = parsed.halted === true;
   } catch {
     lossDay = todayUtc();
