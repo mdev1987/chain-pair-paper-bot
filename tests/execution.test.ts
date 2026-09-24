@@ -158,6 +158,18 @@ describe("quote mappings", () => {
     assert.equal(quote.priceImpactPct, null);
   });
 
+  test("0x maps native zero address to the Eeee alias", async () => {
+    const { nativeAlias } = await import("../src/execution/evm/zeroex.ts");
+    assert.equal(
+      nativeAlias("0x0000000000000000000000000000000000000000"),
+      "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
+    );
+    assert.equal(
+      nativeAlias("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"),
+      "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+    );
+  });
+
   test("0x rejects illiquid pairs and missing amounts (unindexed token)", () => {
     assert.throws(
       () => mapZeroExQuote("bsc", REQ, { liquidityAvailable: false }),

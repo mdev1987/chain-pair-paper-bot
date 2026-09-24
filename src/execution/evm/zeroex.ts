@@ -80,14 +80,21 @@ function apiKey(): string {
   return key;
 }
 
+/** 0x v2 rejects the zero address — native legs use the Eeee alias. Pure. */
+export function nativeAlias(token: string): string {
+  return /^0x0{40}$/i.test(token)
+    ? "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+    : token;
+}
+
 async function fetchZeroExQuote(request: QuoteRequest): Promise<ZeroExQuoteResponse> {
   if (request.chainId === undefined) {
     throw new Error("0x quotes require an EVM chainId");
   }
   const params = new URLSearchParams({
     chainId: String(request.chainId),
-    sellToken: request.sellToken,
-    buyToken: request.buyToken,
+    sellToken: nativeAlias(request.sellToken),
+    buyToken: nativeAlias(request.buyToken),
     sellAmount: request.sellAmountBaseUnits,
     taker: request.taker,
     slippageBps: String(request.slippageBps),
