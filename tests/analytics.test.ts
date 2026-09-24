@@ -172,9 +172,10 @@ describe("trade path record", () => {
     assert.equal(record.costModel, "NET_PNL_100BPS_1PCT");
     assert.ok(Math.abs(totalPnlUsd(position) - 0) < 1e-9);
     assert.ok(Math.abs(record.netPnlUsd - -4) < 1e-9);
-    // Trail trigger was 1.04 (+4%) but the fill printed at 0.9 (-10%):
-    // a gap-through-stop with the modeled cost split stored separately.
-    assert.ok(Math.abs(record.exitTriggerPct - 4) < 1e-9);
+    // Trail trigger was 1.105 (+10.5%, high 1.3 × 0.85 at 15% distance)
+    // but the fill printed at 0.9 (-10%): a gap-through-stop with the
+    // modeled cost split stored separately.
+    assert.ok(Math.abs(record.exitTriggerPct - 10.5) < 1e-9);
     assert.equal(record.gapThroughStop, true);
     assert.ok(Math.abs(record.modeledFeeUsd - 2) < 1e-9);
     assert.ok(Math.abs(record.modeledSlipUsd - 2) < 1e-9);

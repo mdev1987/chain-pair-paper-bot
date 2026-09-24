@@ -233,6 +233,3 @@ export class UniswapV2DirectExecutor implements SwapExecutor {
     return liveSellWithQuoteFlow(this, "Uniswap V2", request);
   }
 }
-
-/** Backwards-compatible alias: the direct quoter is the Uniswap adapter. */
-export const UniswapExecutor = UniswapV2DirectExecutor;

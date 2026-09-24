@@ -33,6 +33,31 @@ function csvLower(name: string, fallback: string): string[] {
 }
 
 /**
+ * Parse paused entry hours ("20,21,22,23" → set). Exported pure for unit
+ * tests. Throws on anything outside integer 0–23 so a typo can never
+ * silently pause (or unpause) trading.
+ */
+export function parseHourSet(
+  raw: string | undefined,
+): Set<number> {
+  const set = new Set<number>();
+  if (raw === undefined || raw.trim() === "") return set;
+  for (const part of raw.split(",")) {
+    const hour = Number(part.trim());
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
+      throw new Error(`Invalid ENTRY_PAUSED_HOURS_UTC hour: "${part}" (want 0-23)`);
+    }
+    set.add(hour);
+  }
+  return set;
+}
+
+/** True when entries are paused at this instant (UTC hours). Pure. */
+export function isEntryPausedAt(now: Date, pausedHoursUtc: Set<number>): boolean {
+  return pausedHoursUtc.has(now.getUTCHours());
+}
+
+/**
  * Parse per-chain position-size overrides ("solana:5,bsc:5" → map).
  * Exported pure for unit tests. Chains are matched case-insensitively;
  * empty input means uniform sizing. Throws on malformed entries so a typo
@@ -79,7 +104,7 @@ export const config = {
     minTxns24h: num("MIN_TXNS_24H", 5),
     chains: csvLower(
       "CHAINS",
-      "solana,base,bsc,ethereum,robinhood,arbitrum,avalanche,polygon",
+      "solana,robinhood",
     ),
     quoteSymbols: csvLower(
       "QUOTE_SYMBOLS",
@@ -123,6 +148,9 @@ export const config = {
     confirmDelayMs: num("ENTRY_CONFIRM_DELAY_MS", 3_000),
     confirmMaxPriceDropPct: num("ENTRY_CONFIRM_MAX_PRICE_DROP_PCT", 5),
     confirmMaxLiqDropPct: num("ENTRY_CONFIRM_MAX_LIQ_DROP_PCT", 30),
+    // Dead hours (UTC) with no edge: 20:00–23:59 printed 37–57% win
+    // rates vs 64–89% in 03:00–12:00. Entries pause; exits run normally.
+    pausedHoursUtc: parseHourSet(process.env.ENTRY_PAUSED_HOURS_UTC ?? "20,21,22,23"),
   },
 
   portfolio: {
@@ -181,7 +209,9 @@ export const config = {
   stops: {
     initialPct: num("INITIAL_STOP_PCT", 15),
     trailActivationPct: num("TRAIL_ACTIVATION_PCT", 30),
-    trailDistancePct: num("TRAIL_DISTANCE_PCT", 20),
+    // Tightened 20 → 15 on ledger evidence: trailing exits averaged
+    // ~102pp giveback from peak (MFE ~130% → exit ~+48%).
+    trailDistancePct: num("TRAIL_DISTANCE_PCT", 15),
   },
 
   telegram: {

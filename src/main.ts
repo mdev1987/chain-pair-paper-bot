@@ -1,4 +1,4 @@
-import { config } from "./config.ts";
+import { config, isEntryPausedAt } from "./config.ts";
 import { fetchNewestPools } from "./dexpaprika.ts";
 import {
   assessConfirmation,
@@ -131,6 +131,16 @@ function restore(): void {
 
 function log(message: string): void {
   console.log(`${new Date().toISOString()} ${message}`);
+}
+
+let lastPausedHourLogMs = 0;
+
+/** Hour-gate notice at most once per hour — discovery runs every 40s. */
+function logPausedHourThrottled(): void {
+  const now = Date.now();
+  if (now - lastPausedHourLogMs < 3_600_000) return;
+  lastPausedHourLogMs = now;
+  log(`⏸️ entries paused (dead UTC hour ${new Date().getUTCHours()}:00) — exits continue`);
 }
 
 /**
@@ -384,6 +394,10 @@ async function processPool(chain: string, pool: Awaited<ReturnType<typeof fetchN
   }
 
   if (!config.entry.auto) return;
+  if (isEntryPausedAt(new Date(), config.entry.pausedHoursUtc)) {
+    logPausedHourThrottled();
+    return;
+  }
   if (positions.size >= config.entry.maxOpenPositions) return;
 
   // Per-chain sizing (uniform POSITION_SIZE_USD unless CHAIN_POSITION_SIZES
@@ -793,7 +807,9 @@ async function main(): Promise<void> {
   console.log(`Chains              : ${config.dexPaprika.chains.join(", ")}`);
   console.log(`Entry band          : age ${config.dexPaprika.minAgeSec}-${config.dexPaprika.maxAgeSec}s, ` +
     `liq $${config.dexPaprika.minLiquidityUsd.toLocaleString()}-$${config.dexPaprika.maxLiquidityUsd.toLocaleString()}, ` +
-    `confirm ${config.entry.confirmEnabled ? `on (${config.entry.confirmDelayMs}ms)` : "off"}`);
+    `confirm ${config.entry.confirmEnabled ? `on (${config.entry.confirmDelayMs}ms)` : "off"}` +
+    (config.entry.pausedHoursUtc.size > 0 ? `, paused ${[...config.entry.pausedHoursUtc].sort((a, b) => a - b).join(",")}h UTC` : ""));
+  console.log(`Stops               : initial ${config.stops.initialPct}% / trail +${config.stops.trailActivationPct}% x ${config.stops.trailDistancePct}%`);
   console.log(`Discovery interval  : ${config.dexPaprika.intervalMs}ms`);
   console.log(`Price interval      : ${config.dexScreener.intervalMs}ms`);
   console.log(`DexScreener RPM cap : ${config.dexScreener.maxRpm}`);
