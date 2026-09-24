@@ -2,6 +2,7 @@ import {
   createPublicClient,
   createWalletClient,
   defineChain,
+  fallback,
   http,
   type Chain,
   type PublicClient,
@@ -151,6 +152,37 @@ export function evmRpcSources(): Record<string, RpcSource> {
   return out;
 }
 
+/**
+ * Optional per-chain failover RPCs: EVM_RPC_FALLBACKS={"robinhood":"https://…"}.
+ * Used as the SECOND transport behind the primary (dRPC for Robinhood via
+ * GetBlock EU). Never logged — values are credentials.
+ */
+function rpcFallbacks(): Record<string, string> {
+  try {
+    const parsed: unknown = JSON.parse(process.env.EVM_RPC_FALLBACKS ?? "{}");
+    if (typeof parsed !== "object" || parsed === null) return {};
+    const out: Record<string, string> = {};
+    for (const [chain, url] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof url === "string" && url) out[chain] = url;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** Chains with a configured failover (banner only — never the URLs). */
+export function evmRpcFallbackChains(): string[] {
+  return Object.keys(rpcFallbacks());
+}
+
+function transportFor(chain: string) {
+  const primary = rpcFor(chain);
+  const secondary = rpcFallbacks()[chain];
+  if (!secondary) return http(primary);
+  return fallback([http(primary), http(secondary)]);
+}
+
 /** Chain definition for viem clients (exported for explicit account+chain calls). */
 export function chainDef(chain: string): Chain {
   const def = KNOWN_CHAINS[chain];
@@ -186,7 +218,7 @@ export async function getEvmTokenDecimals(chain: string, token: `0x${string}`): 
 
 /** Read-only client for quotes, gas, and eth_call simulation. */
 export function getEvmPublicClient(chain: string): PublicClient {
-  return createPublicClient({ chain: chainDef(chain), transport: http(rpcFor(chain)) });
+  return createPublicClient({ chain: chainDef(chain), transport: transportFor(chain) });
 }
 
 /**
@@ -200,5 +232,5 @@ export function getEvmWalletClient(chain: string): WalletClient {
     throw new Error("Refusing to build a signing client: LIVE_TRADING_ENABLED is not true");
   }
   const account = privateKeyToAccount(key as `0x${string}`);
-  return createWalletClient({ account, chain: chainDef(chain), transport: http(rpcFor(chain)) });
+  return createWalletClient({ account, chain: chainDef(chain), transport: transportFor(chain) });
 }

@@ -47,7 +47,7 @@ import {
   SIM_ZERO_TAKER,
   simulateSwap,
 } from "./execution/simulate.ts";
-import { EVM_CHAIN_IDS, evmRpcSources } from "./execution/evm/viem-client.ts";
+import { EVM_CHAIN_IDS, evmRpcFallbackChains, evmRpcSources } from "./execution/evm/viem-client.ts";
 import { initLive, maybeLiveEnter, maybeLiveExit, maybeLiveTp } from "./live.ts";
 import { maybeLiveTestTrade } from "./live-test.ts";
 
@@ -815,6 +815,10 @@ async function main(): Promise<void> {
   const fragileRpcs = Object.entries(rpcSources).filter(([, s]) => s === "none" || s === "public");
   if (fragileRpcs.length > 0) {
     log(`⚠️ EVM chains on fallback/missing RPCs (${fragileRpcs.map(([c, s]) => `${c}=${s}`).join(", ")}) — set EVM_RPC_URLS before any live trading`);
+  }
+  const fbChains = evmRpcFallbackChains();
+  if (fbChains.length > 0) {
+    console.log(`EVM RPC failover    : ${fbChains.join(", ")} (secondary transport behind primary)`);
   }
   console.log(`Jupiter key         : ${process.env.JUPITER_API_KEY ? "present" : "absent (Ultra quotes still work, lower rate limit)"}`);
   console.log(`Live trading        : ${process.env.LIVE_TRADING_ENABLED === "true" ? "ENABLED — real funds at risk" : "off (paper only)"}`);

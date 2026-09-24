@@ -19,7 +19,7 @@ import {
 } from "../src/execution/evm/v4.ts";
 import { routeQuote, type QuoteAdapter } from "../src/execution/evm/router.ts";
 import { PaperExecutor } from "../src/execution/paper.ts";
-import { buildDrpcUrl, buildInfuraUrl } from "../src/execution/evm/viem-client.ts";
+import { buildDrpcUrl, buildInfuraUrl, evmRpcFallbackChains, evmRpcSources, getEvmPublicClient } from "../src/execution/evm/viem-client.ts";
 import {
   decimalsFromDasAsset,
   decimalsFromMintData,
@@ -353,8 +353,42 @@ describe("RPC sources", () => {
     assert.equal(buildDrpcUrl("bsc", undefined), null);
   });
 
-  test("evmRpcSources reflects precedence and missing chains", async () => {
-    const { evmRpcSources } = await import("../src/execution/evm/viem-client.ts");
+  test("evmRpcFallbackChains parses map, ignores garbage", () => {
+    const saved = process.env.EVM_RPC_FALLBACKS;
+    try {
+      delete process.env.EVM_RPC_FALLBACKS;
+      assert.deepEqual(evmRpcFallbackChains(), []);
+      process.env.EVM_RPC_FALLBACKS = JSON.stringify({ robinhood: "https://x/", bsc: 42, empty: "" });
+      assert.deepEqual(evmRpcFallbackChains(), ["robinhood"]);
+      process.env.EVM_RPC_FALLBACKS = "{broken";
+      assert.deepEqual(evmRpcFallbackChains(), []);
+    } finally {
+      if (saved === undefined) delete process.env.EVM_RPC_FALLBACKS;
+      else process.env.EVM_RPC_FALLBACKS = saved;
+    }
+  });
+
+  test("failover transport survives a dead primary (live GetBlock drill)", async () => {
+    // Needs a real fallback URL in the environment (gitignored .env);
+    // skips silently without one so CI stays hermetic.
+    let fallbacks: Record<string, string> = {};
+    try {
+      fallbacks = JSON.parse(process.env.EVM_RPC_FALLBACKS ?? "{}") as Record<string, string>;
+    } catch {
+      return;
+    }
+    if (typeof fallbacks.robinhood !== "string" || !fallbacks.robinhood) return;
+    const savedOverride = process.env.EVM_RPC_URLS;
+    try {
+      process.env.EVM_RPC_URLS = JSON.stringify({ robinhood: "https://example.invalid/" });
+      const block = await getEvmPublicClient("robinhood").getBlockNumber();
+      assert.ok(block > 0n, "failover transport must serve reads past a dead primary");
+    } finally {
+      if (savedOverride === undefined) delete process.env.EVM_RPC_URLS;
+      else process.env.EVM_RPC_URLS = savedOverride;
+    }
+  });
+  test("evmRpcSources reflects precedence and missing chains", () => {
     const savedDrpc = process.env.DRPC_API_KEY;
     const savedInfura = process.env.INFURA_API_KEY;
     const savedOverride = process.env.EVM_RPC_URLS;
