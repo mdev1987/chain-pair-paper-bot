@@ -69,12 +69,15 @@ const V2_ROUTER_ABI = [
 ] as const;
 
 /** Canonical V2 Router02 deployments. Missing chains fall through (env override below). */
-const V2_ROUTERS: Record<string, `0x${string}`> = {
-  ethereum: "0x7a250d5630B4cF539739dF2C5dAcb4c964c2C56d5",
-  bsc: "0x10ED43C718714eb63d5aA57B78f8f22B7D854c",
+export const V2_ROUTERS: Record<string, `0x${string}`> = {
+  ethereum: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+  bsc: "0x10ED43C718714eb63d5aA57B78B54704E256024E",
+  base: "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb",
+  arbitrum: "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb",
+  robinhood: "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb",
 };
 
-function v2RouterFor(chain: string): `0x${string}` {
+export function v2RouterFor(chain: string): `0x${string}` {
   try {
     const overrides: unknown = JSON.parse(process.env.UNISWAP_V2_ROUTERS ?? "{}");
     const custom = (overrides as Record<string, string>)[chain];

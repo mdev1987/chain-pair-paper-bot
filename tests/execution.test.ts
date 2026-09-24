@@ -2,15 +2,23 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { assessQuoteRisk } from "../src/execution/risk.ts";
 import { selectBestQuote } from "../src/execution/evm/router.ts";
-import { mapJupiterOrder } from "../src/execution/solana/jupiter.ts";
+import { mapJupiterOrder, jupiterTakerParam } from "../src/execution/solana/jupiter.ts";
 import { mapZeroExQuote } from "../src/execution/evm/zeroex.ts";
-import { quoteV2AmountOut, UniswapV2DirectExecutor } from "../src/execution/evm/uniswap.ts";
+import {
+  quoteV2AmountOut,
+  UniswapV2DirectExecutor,
+  V2_ROUTERS,
+  v2RouterFor,
+} from "../src/execution/evm/uniswap.ts";
+import { routeQuote, type QuoteAdapter } from "../src/execution/evm/router.ts";
 import { PaperExecutor } from "../src/execution/paper.ts";
-import { buildDrpcUrl, buildInfuraUrl } from "../src/execution/evm/viem-client.ts";import {
+import { buildDrpcUrl, buildInfuraUrl } from "../src/execution/evm/viem-client.ts";
+import {
   decimalsFromDasAsset,
   decimalsFromMintData,
 } from "../src/execution/solana/helius.ts";
 import type { Quote, QuoteRequest, RiskPolicy } from "../src/execution/types.ts";
+import { SIM_ZERO_TAKER } from "../src/execution/simulate.ts";
 
 function baseQuote(overrides: Partial<Quote> = {}): Quote {
   return {
@@ -187,6 +195,77 @@ describe("PaperExecutor", () => {  test("quotes at the mark with decimal scaling
   test("requires a positive mark price", async () => {
     const paper = new PaperExecutor();
     await assert.rejects(paper.quoteBuy(REQ), /markPrice/);
+  });
+});
+
+describe("quote-check regression fixes", () => {
+  test("V2 routers are valid checksummed 40-hex addresses", async () => {
+    const { isAddress, getAddress } = await import("viem");
+    for (const [chain, addr] of Object.entries(V2_ROUTERS)) {
+      assert.equal(isAddress(addr), true, `${chain} invalid: ${addr}`);
+      assert.equal(getAddress(addr), addr, `${chain} not checksummed: ${addr}`);
+      assert.equal(addr.length, 42, `${chain} must be 0x + 40 hex`);
+    }
+    assert.equal(
+      V2_ROUTERS.bsc,
+      "0x10ED43C718714eb63d5aA57B78B54704E256024E",
+      "PancakeSwap V2 Router02 BSC",
+    );
+    assert.equal(
+      V2_ROUTERS.ethereum,
+      "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+      "Uniswap V2 Router02 Ethereum",
+    );
+    assert.equal(v2RouterFor("robinhood"), V2_ROUTERS.robinhood);
+    const prevEnv = process.env.UNISWAP_V2_ROUTERS;
+    delete process.env.UNISWAP_V2_ROUTERS;
+    try {
+      assert.throws(() => v2RouterFor("missing-chain"), /No V2 router configured/);
+    } finally {
+      if (prevEnv !== undefined) process.env.UNISWAP_V2_ROUTERS = prevEnv;
+    }
+  });
+
+  test("jupiter omits EVM/zero/empty taker, keeps plausible Solana pubkeys", () => {
+    assert.equal(jupiterTakerParam(""), null);
+    assert.equal(jupiterTakerParam(SIM_ZERO_TAKER), null);
+    assert.equal(jupiterTakerParam("0x1111111111111111111111111111111111111111"), null);
+    assert.equal(jupiterTakerParam("short"), null);
+    const sol = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+    assert.equal(jupiterTakerParam(sol), sol);
+  });
+
+  test("routeQuote skips 0x when ZEROEX_API_KEY is unset", async () => {
+    const prev = process.env.ZEROEX_API_KEY;
+    delete process.env.ZEROEX_API_KEY;
+    let zeroexCalled = false;
+    const zeroex: QuoteAdapter = {
+      name: "0x",
+      quoteBuy: async () => {
+        zeroexCalled = true;
+        throw new Error("should not be called");
+      },
+      quoteSell: async () => {
+        zeroexCalled = true;
+        throw new Error("should not be called");
+      },
+    };
+    const uniswap: QuoteAdapter = {
+      name: "uniswap",
+      quoteBuy: async () => baseQuote({ source: "uniswap", buyAmount: "900" }),
+      quoteSell: async () => baseQuote({ source: "uniswap", buyAmount: "900" }),
+    };
+    try {
+      const quote = await routeQuote(
+        [zeroex, uniswap],
+        { ...REQ, chain: "bsc", chainId: 56, taker: SIM_ZERO_TAKER },
+        "buy",
+      );
+      assert.equal(quote.source, "uniswap");
+      assert.equal(zeroexCalled, false);
+    } finally {
+      if (prev !== undefined) process.env.ZEROEX_API_KEY = prev;
+    }
   });
 });
 

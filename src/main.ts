@@ -215,6 +215,20 @@ function simTaker(): string {
   return process.env.SIM_TAKER_ADDRESS ?? SIM_ZERO_TAKER;
 }
 
+function simTakerFor(chain: string): string {
+  // Solana: omit the EVM zero address entirely (Jupiter rejects it);
+  // quote-only diagnostics work without a taker. EVM keeps the zero
+  // address as eth_call sender until a real SIM_TAKER_ADDRESS exists.
+  if (chain === "solana") {
+    const configured = process.env.SIM_TAKER_ADDRESS ?? "";
+    if (configured && !/^0x0{40}$/i.test(configured) && !configured.startsWith("0x")) {
+      return configured;
+    }
+    return "";
+  }
+  return simTaker();
+}
+
 function chainIdFor(chain: string): number | undefined {
   return EVM_CHAIN_IDS[chain];
 }
@@ -255,7 +269,7 @@ async function recordEntryQuoteCheck(
       sellDecimals: qd,
       buyDecimals: null,
       pairAddress: activePair.pairAddress,
-      taker: simTaker(),
+      taker: simTakerFor(position.chain),
       slippageBps: 100,
     });
     await recordQuoteCheck({
@@ -304,7 +318,7 @@ async function recordExitQuoteCheck(
       sellDecimals: tokenDec,
       buyDecimals: qd ?? null,
       pairAddress: position.pairAddress,
-      taker: simTaker(),
+      taker: simTakerFor(position.chain),
       slippageBps: 100,
     });
     await recordQuoteCheck({

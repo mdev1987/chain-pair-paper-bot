@@ -43,6 +43,7 @@ describe("simulation helpers", () => {
       ["0x", "uniswap"],
     );
     assert.deepEqual(quoteAdaptersFor("bsc").map((a) => a.name), ["0x"]);
+    assert.deepEqual(quoteAdaptersFor("robinhood", "0x0000000000000000000000000000000000000001").map((a) => a.name), ["0x", "uniswap"]);
     assert.deepEqual(quoteAdaptersFor("unknown-chain"), []);
   });
 

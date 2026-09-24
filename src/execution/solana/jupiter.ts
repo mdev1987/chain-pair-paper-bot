@@ -83,6 +83,19 @@ export function mapJupiterOrder(
   };
 }
 
+/**
+ * Taker query param for /order: omitted for quote-only diagnostics.
+ * The EVM zero address is not a valid Solana pubkey — sending it 400s
+ * with "Invalid taker". Returns null when the param must be left off.
+ */
+export function jupiterTakerParam(taker: string): string | null {
+  if (!taker) return null;
+  if (/^0x0{40}$/i.test(taker)) return null;
+  if (taker.startsWith("0x")) return null; // any other EVM address
+  if (taker.length < 32 || taker.length > 44) return null;
+  return taker;
+}
+
 export async function fetchJupiterOrder(
   request: QuoteRequest,
 ): Promise<JupiterOrderResponse> {
@@ -92,9 +105,8 @@ export async function fetchJupiterOrder(
     amount: request.sellAmountBaseUnits,
     slippageBps: String(request.slippageBps),
   });
-  // Taker omitted = quote-only (no assembled transaction). Used for
-  // simulation diagnostics when no trader address is configured.
-  if (request.taker) params.set("taker", request.taker);
+  const taker = jupiterTakerParam(request.taker);
+  if (taker) params.set("taker", taker);
   const response = await fetch(`${JUPITER_V2_BASE}/order?${params}`, {
     headers: { accept: "application/json", ...apiKeyHeader() },
   });

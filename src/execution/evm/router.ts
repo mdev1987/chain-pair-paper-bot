@@ -42,6 +42,11 @@ export async function routeQuote(
   const quotes: Quote[] = [];
   const errors: string[] = [];
   for (const adapter of adapters) {
+    // ZeroEx without a key always fails — skip the wasted round-trip.
+    if (adapter.name === "0x" && !process.env.ZEROEX_API_KEY) {
+      errors.push("0x: ZEROEX_API_KEY is not configured");
+      continue;
+    }
     try {
       const quote = kind === "buy"
         ? await adapter.quoteBuy(request)
