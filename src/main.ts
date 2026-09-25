@@ -400,6 +400,17 @@ async function recordExitQuoteCheck(
     paperPriceUsd: exitPrice,
   };
   try {
+    // Worthless exits (dust remainder written to zero) have no quantity to
+    // quote — record the skip explicitly instead of throwing downstream.
+    if (!Number.isFinite(soldQty) || soldQty <= 0) {
+      const note = "zero-quantity-exit";
+      await recordQuoteCheck({
+        ...base, source: "skipped", quotedSellAmount: "", quotedBuyAmount: "",
+        sellDecimals: null, buyDecimals: null, riskPass: null, simOk: null,
+        note,
+      });
+      return { source: "skipped", note };
+    }
     const tokenDec = await resolveTokenDecimals(position.chain, position.tokenAddress);
     const qd = KNOWN_QUOTE_DECIMALS[position.quoteSymbol.toLowerCase()];
     if (tokenDec === null) {
