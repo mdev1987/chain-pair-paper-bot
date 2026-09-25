@@ -11,7 +11,7 @@ export interface QuoteCheckRecord {
   side: "BUY" | "SELL";
   /** Adapter name, or "skipped" when no quote was attempted. */
   source: string;
-  paperPriceUsd: number;
+  paperPriceUsd: number | null;
   quotedSellAmount: string;
   quotedBuyAmount: string;
   sellDecimals: number | null;
@@ -26,7 +26,7 @@ export interface PositionSnapshotTick {
   positionId: string;
   chain: string;
   symbol: string;
-  price: number;
+  price: number | null;
   liquidityUsd: number | null;
   /** Raw DexScreener txn/volume mix, JSON-encoded (shape varies by venue). */
   txnsJson: string;
@@ -44,11 +44,11 @@ export interface FillRecord {
   pool: string;
   ca: string;
   quote: string;
-  price: number;
-  qty: number;
-  notionalUsd: number;
-  feeUsd: number;
-  slipUsd: number;
+  price: number | null;
+  qty: number | null;
+  notionalUsd: number | null;
+  feeUsd: number | null;
+  slipUsd: number | null;
   detail: string;
   /** Cash after the fill. Always cash — never equity (see equityAfterUsd). */
   balanceAfterUsd: number;
@@ -72,48 +72,48 @@ export interface TradeRecord {
   openedAt: number;
   closedAt: number;
   durationS: number;
-  entryPrice: number;
-  exitPrice: number;
-  highPrice: number;
-  sizeUsd: number;
-  pnlUsd: number;
-  pnlPct: number;
+  entryPrice: number | null;
+  exitPrice: number | null;
+  highPrice: number | null;
+  sizeUsd: number | null;
+  pnlUsd: number | null;
+  pnlPct: number | null;
   reason: string;
   tpLevels: string;
-  feesUsd: number;
-  slipUsd: number;
-  balanceBeforeUsd: number;
-  balanceAfterUsd: number;
+  feesUsd: number | null;
+  slipUsd: number | null;
+  balanceBeforeUsd: number | null;
+  balanceAfterUsd: number | null;
   entryLiquidityUsd: number | null;
   exitLiquidityUsd: number | null;
   entryAgeS: number | null;
   /** Gross PnL minus the shadow cost model — research only, never cash. */
-  netPnlUsd: number;
+  netPnlUsd: number | null;
   /** Cost-model convention label (e.g. NET_PNL_100BPS_1PCT), explicit per row. */
   costModel: string;
   /** Max favorable excursion, % vs entry. */
-  mfePct: number;
+  mfePct: number | null;
   /** Max adverse excursion, % vs entry (<= 0). */
-  maePct: number;
+  maePct: number | null;
   /** Exit mark, % vs entry. */
-  exitPct: number;
+  exitPct: number | null;
   /** Giveback in percentage points: mfePct - exitPct. */
-  givebackPp: number;
+  givebackPp: number | null;
   /** Seconds from open to the high-water mark. */
   timeToMfeS: number;
   /** Seconds from open to the low-water mark. */
   timeToMaeS: number;
   /** Stop level that triggered the exit, % vs entry (fill itself for TIME_EXIT). */
-  exitTriggerPct: number;
+  exitTriggerPct: number | null;
   /**
    * True when execution printed materially worse than the trigger, i.e. the
    * price gapped through the stop between polls. Tolerance below.
    */
   gapThroughStop: boolean;
   /** Shadow modeled fee component (research only, never cash). */
-  modeledFeeUsd: number;
+  modeledFeeUsd: number | null;
   /** Shadow modeled slippage component (research only, never cash). */
-  modeledSlipUsd: number;
+  modeledSlipUsd: number | null;
   /**
    * True when the exit quote diagnostic found a drained pool (no active
    * liquidity), i.e. the paper fill may overstate an unexitable exit.
@@ -287,6 +287,22 @@ async function ensure(): Promise<DuckDBConnection | null> {
   return ok && connPath === armed.path ? conn : null;
 }
 
+/**
+ * Binding guard: @duckdb/node-api throws "bigint out of int64 range" for
+ * any JS number with abs >= 2^63 — even into DOUBLE columns. A single
+ * garbage DexScreener print (observed: $9.1e41) used to poison the write
+ * AND latch `failure` until restart. Out-of-range/non-finite values become
+ * NULL (all value columns are nullable) so one bad print can never kill
+ * the ledger again. Integer clock fields (time, durations) bypass this —
+ * they are Date.now()-derived and provably small.
+ */
+const INT64_MAX = 2 ** 63;
+function num(value: number | null | undefined): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  if (Math.abs(value) >= INT64_MAX) return null;
+  return value;
+}
+
 /** Append one execution (entry fill, TP partial, final exit). Best-effort. */
 export async function recordFill(fill: FillRecord): Promise<void> {
   const c = await ensure();
@@ -302,8 +318,9 @@ export async function recordFill(fill: FillRecord): Promise<void> {
       [
         fill.time, fill.side, fill.positionId, fill.chain, fill.dex,
         fill.symbol, fill.tokenName, fill.pair, fill.pool, fill.ca,
-        fill.quote, fill.price, fill.qty, fill.notionalUsd, fill.feeUsd,
-        fill.slipUsd, fill.detail, fill.balanceAfterUsd, fill.equityAfterUsd,
+        fill.quote, num(fill.price), num(fill.qty), num(fill.notionalUsd),
+        num(fill.feeUsd), num(fill.slipUsd), fill.detail,
+        num(fill.balanceAfterUsd), num(fill.equityAfterUsd),
       ],
     );
   } catch (error) {
@@ -322,7 +339,7 @@ export async function recordSnapshot(tick: PositionSnapshotTick): Promise<void> 
       `INSERT INTO position_snapshots VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [
         tick.time, tick.positionId, tick.chain, tick.symbol,
-        tick.price, tick.liquidityUsd, tick.txnsJson,
+        num(tick.price), num(tick.liquidityUsd), tick.txnsJson,
       ],
     );
   } catch (error) {
@@ -341,7 +358,7 @@ export async function recordQuoteCheck(check: QuoteCheckRecord): Promise<void> {
       `INSERT INTO quote_checks VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [
         check.time, check.positionId, check.chain, check.side, check.source,
-        check.paperPriceUsd, check.quotedSellAmount, check.quotedBuyAmount,
+        num(check.paperPriceUsd), check.quotedSellAmount, check.quotedBuyAmount,
         check.sellDecimals, check.buyDecimals, check.riskPass, check.simOk,
         check.note,
       ],
@@ -373,15 +390,18 @@ export async function recordTrade(trade: TradeRecord): Promise<void> {
       [
         trade.positionId, trade.chain, trade.dex, trade.symbol,
         trade.tokenName, trade.pair, trade.pool, trade.ca, trade.quote,
-        trade.openedAt, trade.closedAt, trade.durationS, trade.entryPrice,
-        trade.exitPrice, trade.highPrice, trade.sizeUsd, trade.pnlUsd,
-        trade.pnlPct, trade.reason, trade.tpLevels, trade.feesUsd,
-        trade.slipUsd, trade.balanceBeforeUsd, trade.balanceAfterUsd,
-        trade.entryLiquidityUsd, trade.exitLiquidityUsd, trade.entryAgeS,
-        trade.netPnlUsd, trade.costModel, trade.mfePct, trade.maePct,
-        trade.exitPct, trade.givebackPp, trade.timeToMfeS, trade.timeToMaeS,
-        trade.exitTriggerPct, trade.gapThroughStop,
-        trade.modeledFeeUsd, trade.modeledSlipUsd, trade.drainedExit,
+        trade.openedAt, trade.closedAt, trade.durationS,
+        num(trade.entryPrice), num(trade.exitPrice), num(trade.highPrice),
+        num(trade.sizeUsd), num(trade.pnlUsd), num(trade.pnlPct),
+        trade.reason, trade.tpLevels,
+        num(trade.feesUsd), num(trade.slipUsd),
+        num(trade.balanceBeforeUsd), num(trade.balanceAfterUsd),
+        num(trade.entryLiquidityUsd), num(trade.exitLiquidityUsd), trade.entryAgeS,
+        num(trade.netPnlUsd), trade.costModel,
+        num(trade.mfePct), num(trade.maePct), num(trade.exitPct), num(trade.givebackPp),
+        trade.timeToMfeS, trade.timeToMaeS, num(trade.exitTriggerPct),
+        trade.gapThroughStop,
+        num(trade.modeledFeeUsd), num(trade.modeledSlipUsd), trade.drainedExit,
       ],
     );
   } catch (error) {

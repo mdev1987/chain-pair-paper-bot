@@ -166,10 +166,10 @@ describe("trade path record", () => {
     });
 
     // Path: high 1.3 (+30%), low/exit 0.9 (-10%).
-    assert.ok(Math.abs(record.mfePct - 30) < 1e-9);
-    assert.ok(Math.abs(record.maePct - -10) < 1e-9);
-    assert.ok(Math.abs(record.exitPct - -10) < 1e-9);
-    assert.ok(Math.abs(record.givebackPp - 40) < 1e-9);
+    assert.ok(Math.abs(record.mfePct! - 30) < 1e-9);
+    assert.ok(Math.abs(record.maePct! - -10) < 1e-9);
+    assert.ok(Math.abs(record.exitPct! - -10) < 1e-9);
+    assert.ok(Math.abs(record.givebackPp! - 40) < 1e-9);
     assert.equal(record.timeToMfeS, 1);
     assert.equal(record.timeToMaeS, 2);
 
@@ -178,17 +178,17 @@ describe("trade path record", () => {
     // (Assumes default PAPER_*_FEE/SLIPPAGE_BPS=0 and TP1 30%/25%.)
     assert.equal(record.costModel, "NET_PNL_100BPS_1PCT");
     assert.ok(Math.abs(totalPnlUsd(position) - 0) < 1e-9);
-    assert.ok(Math.abs(record.netPnlUsd - -4) < 1e-9);
+    assert.ok(Math.abs(record.netPnlUsd! - -4) < 1e-9);
     // Trail trigger derives from live config (default 15% distance:
     // 1.105, +10.5% off high 1.3) so this test stays hermetic under any
     // TRAIL_DISTANCE_PCT env. The fill printed at 0.9 (-10%): a
     // gap-through-stop with the modeled cost split stored separately.
     const trailTrigger = 1.3 * (1 - config.stops.trailDistancePct / 100);
     const trailTriggerPct = (trailTrigger / 1 - 1) * 100;
-    assert.ok(Math.abs(record.exitTriggerPct - trailTriggerPct) < 1e-9);
+    assert.ok(Math.abs(record.exitTriggerPct! - trailTriggerPct) < 1e-9);
     assert.equal(record.gapThroughStop, true);
-    assert.ok(Math.abs(record.modeledFeeUsd - 2) < 1e-9);
-    assert.ok(Math.abs(record.modeledSlipUsd - 2) < 1e-9);
+    assert.ok(Math.abs(record.modeledFeeUsd! - 2) < 1e-9);
+    assert.ok(Math.abs(record.modeledSlipUsd! - 2) < 1e-9);
   });
 
   test("breakeven trigger with catastrophic fill flags the gap (CATO profile)", () => {
@@ -217,8 +217,8 @@ describe("trade path record", () => {
       balanceAfterUsd: 10_000,
     });
     // Trigger was breakeven (0%) but the fill was -95%: unmistakable gap.
-    assert.ok(Math.abs(record.exitTriggerPct - 0) < 1e-9);
-    assert.ok(Math.abs(record.exitPct - -95) < 1e-9);
+    assert.ok(Math.abs(record.exitTriggerPct! - 0) < 1e-9);
+    assert.ok(Math.abs(record.exitPct! - -95) < 1e-9);
     assert.equal(record.gapThroughStop, true);
   });
 
@@ -245,7 +245,69 @@ describe("trade path record", () => {
       balanceBeforeUsd: 10_000,
       balanceAfterUsd: 10_000,
     });
-    assert.ok(Math.abs(record.exitTriggerPct - -15) < 1e-9);
+    assert.ok(Math.abs(record.exitTriggerPct! - -15) < 1e-9);
     assert.equal(record.gapThroughStop, false);
+  });
+
+  test("garbage-magnitude values land as NULL instead of killing the ledger", async () => {
+    // Regression: a $9.1e41 garbage print threw "bigint out of int64 range"
+    // and latched the ledger FAILED. Absurd magnitudes must degrade to NULL.
+    await recordFill({
+      time: 9_000, side: "SELL", positionId: "solana:GARBAGE", chain: "solana",
+      dex: "raydium", symbol: "GARBAGE", tokenName: "Garbage",
+      pair: "P", pool: "", ca: "C", quote: "SOL",
+      price: 9.1018010e41, qty: 1e5, notionalUsd: 9.1018010e46,
+      feeUsd: 0, slipUsd: 0, detail: "DRAIN_EXIT",
+      balanceAfterUsd: 100, equityAfterUsd: 100,
+    });
+    await recordSnapshot({
+      time: 9_001, positionId: "solana:GARBAGE", chain: "solana", symbol: "GARBAGE",
+      price: Infinity, liquidityUsd: 1e20, txnsJson: "{}",
+    });
+    await recordTrade({
+      positionId: "solana:GARBAGE", chain: "solana", dex: "raydium",
+      symbol: "GARBAGE", tokenName: "Garbage", pair: "P", pool: "",
+      ca: "C", quote: "SOL", openedAt: 8_000, closedAt: 9_000, durationS: 1,
+      entryPrice: 1, exitPrice: 9.1018010e41, highPrice: 2, sizeUsd: 10,
+      pnlUsd: 5, pnlPct: 50, reason: "DRAIN_EXIT", tpLevels: "", feesUsd: 0,
+      slipUsd: 0, balanceBeforeUsd: 100, balanceAfterUsd: 105,
+      entryLiquidityUsd: 20_000, exitLiquidityUsd: 10, entryAgeS: 60,
+      netPnlUsd: 4, costModel: "NET_PNL_100BPS_1PCT",
+      mfePct: 100, maePct: -10, exitPct: 50, givebackPp: 50, timeToMfeS: 1,
+      timeToMaeS: 1, exitTriggerPct: 50, gapThroughStop: false,
+      modeledFeeUsd: 0.1, modeledSlipUsd: 0.1, drainedExit: true,
+    });
+    const fills = await analyticsQuery<Record<string, unknown>>(
+      "SELECT price, qty, notional_usd FROM fills WHERE position_id = 'solana:GARBAGE'",
+    );
+    assert.equal(fills.length, 1);
+    assert.equal(fills[0]!.price, null);
+    assert.equal(fills[0]!.qty, 100_000);
+    assert.equal(fills[0]!.notional_usd, null);
+    const snaps = await analyticsQuery<Record<string, unknown>>(
+      "SELECT price FROM position_snapshots WHERE position_id = 'solana:GARBAGE'",
+    );
+    assert.equal(snaps[0]!.price, null);
+    const trades = await analyticsQuery<Record<string, unknown>>(
+      "SELECT exit_price, pnl_usd FROM trades WHERE position_id = 'solana:GARBAGE'",
+    );
+    assert.equal(trades[0]!.exit_price, null);
+    assert.equal(trades[0]!.pnl_usd, 5);
+    // Ledger still writable after absorbing garbage (no FAILED latch that
+    // would null the connection — the next write must land). Note: no
+    // analyticsStatus() assertion here; the hermetic suite disables the
+    // global analytics flag, so status reads "disabled" by design.
+    await recordFill({
+      time: 9_002, side: "SELL", positionId: "solana:GARBAGE", chain: "solana",
+      dex: "raydium", symbol: "GARBAGE", tokenName: "Garbage",
+      pair: "P", pool: "", ca: "C", quote: "SOL",
+      price: 2, qty: 3, notionalUsd: 6, feeUsd: 0, slipUsd: 0, detail: "TP1",
+      balanceAfterUsd: 106, equityAfterUsd: 106,
+    });
+    const after = await analyticsQuery<Record<string, unknown>>(
+      "SELECT price FROM fills WHERE position_id = 'solana:GARBAGE' AND time = 9002",
+    );
+    assert.equal(after.length, 1);
+    assert.equal(after[0]!.price, 2);
   });
 });
